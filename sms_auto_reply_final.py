@@ -85,7 +85,8 @@ def sms_auto_reply():
     for msg in messages:
         msg_id = msg.get("ID")
         number = msg.get("number")
-        device_from_msg = msg.get("device")
+        device_from_msg = msg.get("deviceID")  # ✅ CORRECTION
+
         log(f"🔁 Nouveau message détecté : ID={msg_id}, number={number}, device={device_from_msg}")
 
         if not msg_id or not number or not device_from_msg:
@@ -132,7 +133,6 @@ def sms_auto_reply():
     log("💾 Conversations sauvegardées ✅")
     return "✔️ Messages traités avec succès", 200
 
-# ✅ Endpoint de lecture des logs
 @app.route('/logs', methods=['GET'])
 def read_logs():
     if not os.path.exists(LOG_FILE):
