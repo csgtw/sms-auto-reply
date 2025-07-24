@@ -64,24 +64,30 @@ def sms_auto_reply():
 
     messages_raw = request.form.get("messages")
     if not messages_raw:
+        log("❌ messages_raw manquant")
         return "Requête invalide : messages manquants", 400
 
     if not DEBUG_MODE and "X-SG-SIGNATURE" in request.headers:
         signature = request.headers.get("X-SG-SIGNATURE")
         expected_hash = base64.b64encode(hmac.new(API_KEY.encode(), messages_raw.encode(), hashlib.sha256).digest()).decode()
         if signature != expected_hash:
+            log("❌ Signature invalide")
             return "Signature invalide", 403
 
     try:
         messages = json.loads(messages_raw)
+        log(f"✔️ messages_raw reçu : {messages_raw}")
     except json.JSONDecodeError:
+        log("❌ Format JSON invalide")
         return "Format JSON invalide", 400
 
     for msg in messages:
         msg_id = msg.get("ID")
         number = msg.get("number")
         device_from_msg = msg.get("device")
+
         if not msg_id or not number or not device_from_msg:
+            log(f"⛔️ Message ignoré : ID={msg_id}, number={number}, device={device_from_msg}")
             continue
 
         if number not in conversations:
@@ -90,9 +96,10 @@ def sms_auto_reply():
                 "device": device_from_msg,
                 "processed_ids": []
             }
+            log(f"🆕 Nouvelle conversation avec {number}")
 
-        # Ignorer si ce message a déjà été traité
         if msg_id in conversations[number]["processed_ids"]:
+            log(f"🔁 Message déjà traité (ID={msg_id}) pour {number}")
             continue
 
         step = conversations[number]["step"]
@@ -105,21 +112,21 @@ def sms_auto_reply():
             reply = "Ok alors choisissez ici votre nouveau créneau ou point relais : https://suivi-coursier.com/183248\nSans ça je peux rien faire, merci et bonne journée."
             conversations[number]["step"] = 2
         else:
-            log(f"Fin de conversation avec {number}")
+            log(f"✅ Fin de conversation avec {number}")
             conversations.pop(number, None)
             continue
 
         try:
             send_single_message(number, reply, device_id)
-            log(f"Envoi à {number} via {device_id} : {reply}")
+            log(f"📤 Envoi à {number} via {device_id} : {reply}")
         except Exception as e:
-            log(f"Erreur envoi à {number} : {str(e)}")
+            log(f"❌ Erreur envoi à {number} : {str(e)}")
 
-        # Marquer le message comme traité (anti-doublon)
         conversations[number]["processed_ids"].append(msg_id)
         conversations[number]["processed_ids"] = list(set(conversations[number]["processed_ids"]))[-10:]
 
     save_json(STORAGE_FILE, conversations)
+    log(f"💾 Conversations sauvegardées")
     return "✔️ Messages traités avec succès", 200
 
 if __name__ == "__main__":
