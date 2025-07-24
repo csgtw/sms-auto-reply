@@ -3,6 +3,7 @@ import os
 import hmac
 import hashlib
 import base64
+import time  # ✅ Ajout pour le délai
 from flask import Flask, request, abort, Response
 from datetime import datetime
 
@@ -121,6 +122,8 @@ def sms_auto_reply():
             continue
 
         try:
+            log("⏳ Attente de 60 secondes avant l’envoi...")
+            time.sleep(60)  # ✅ Délai de 1 minute
             send_single_message(number, reply, device_id)
             log(f"📤 Message envoyé à {number} : {reply}")
         except Exception as e:
