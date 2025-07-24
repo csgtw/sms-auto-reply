@@ -11,7 +11,7 @@ SERVER = "https://coursier-prbs.com/"
 API_KEY = "39a97416a08e10e381674867f42cf3a3d1f98bf1"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), 'conversations.json')
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'log.txt')
-DEBUG_MODE = True  # Désactiver la vérification de signature si besoin
+DEBUG_MODE = True  # Pour ignorer la signature pendant les tests
 
 app = Flask(__name__)
 
@@ -126,7 +126,7 @@ def sms_auto_reply():
         conversations[number]["processed_ids"] = list(set(conversations[number]["processed_ids"]))[-10:]
 
     save_json(STORAGE_FILE, conversations)
-    log(f"💾 Conversations sauvegardées")
+    log("💾 Conversations sauvegardées")
     return "✔️ Messages traités avec succès", 200
 
 if __name__ == "__main__":
