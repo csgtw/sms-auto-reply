@@ -11,7 +11,7 @@ SERVER = "https://coursier-prbs.com/"
 API_KEY = "39a97416a08e10e381674867f42cf3a3d1f98bf1"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), 'conversations.json')
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'log.txt')
-DEBUG_MODE = False  # Désactiver la vérification de signature si besoin
+DEBUG_MODE = True  # Désactiver la vérification de signature si besoin
 
 app = Flask(__name__)
 
