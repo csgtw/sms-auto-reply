@@ -7,8 +7,8 @@ from flask import Flask, request, abort
 from datetime import datetime
 
 # Configuration
-SERVER = "https://moncolis-attente.com/"
-API_KEY = "f376d32d14b058ed2383b97fd568d1b26de1b75c"
+SERVER = "https://coursier-prbs.com/"
+API_KEY = "39a97416a08e10e381674867f42cf3a3d1f98bf1"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), 'conversations.json')
 LOG_FILE = os.path.join(os.path.dirname(__file__), 'log.txt')
 DEBUG_MODE = False  # Désactiver la vérification de signature si besoin
@@ -55,8 +55,7 @@ def log(text):
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"[{datetime.utcnow().isoformat()}] {text}\n")
 
-# ICI : endpoint racine modifié pour que Render fonctionne directement
-@app.route('/', methods=['POST'])
+@app.route('/sms_auto_reply', methods=['POST'])
 def sms_auto_reply():
     conversations = load_json(STORAGE_FILE)
 
@@ -122,3 +121,6 @@ def sms_auto_reply():
 
     save_json(STORAGE_FILE, conversations)
     return "✔️ Messages traités avec succès", 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
