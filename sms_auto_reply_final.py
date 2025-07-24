@@ -33,7 +33,7 @@ def send_single_message(number, message, device_slot):
         'message': message,
         'devices': device_slot,
         'type': 'mms',
-        'prioritize': 'true',
+        'prioritize': 1,  # ✅ DOIT être un ENTIER
         'key': API_KEY,
     }
     return send_request(f"{SERVER}/services/send.php", post_data)
@@ -85,7 +85,7 @@ def sms_auto_reply():
     for msg in messages:
         msg_id = msg.get("ID")
         number = msg.get("number")
-        device_from_msg = msg.get("deviceID")  # ✅ CORRECTION
+        device_from_msg = msg.get("deviceID")  # ✅ ICI le bon champ
 
         log(f"🔁 Nouveau message détecté : ID={msg_id}, number={number}, device={device_from_msg}")
 
