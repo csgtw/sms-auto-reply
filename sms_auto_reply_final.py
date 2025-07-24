@@ -55,7 +55,8 @@ def log(text):
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"[{datetime.utcnow().isoformat()}] {text}\n")
 
-@app.route('/sms_auto_reply', methods=['POST'])
+# ICI : endpoint racine modifié pour que Render fonctionne directement
+@app.route('/', methods=['POST'])
 def sms_auto_reply():
     conversations = load_json(STORAGE_FILE)
 
