@@ -3,14 +3,14 @@ import os
 import hmac
 import hashlib
 import base64
-from flask import Flask, request, abort
+from flask import Flask, request, abort, Response
 from datetime import datetime
 
 # Configuration
 SERVER = "https://coursier-prbs.com/"
 API_KEY = "39a97416a08e10e381674867f42cf3a3d1f98bf1"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), 'conversations.json')
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'log.txt')
+LOG_FILE = '/tmp/log.txt'  # ✅ Compatible avec Render
 DEBUG_MODE = True  # Pour ignorer la signature pendant les tests
 
 app = Flask(__name__)
@@ -57,15 +57,16 @@ def log(text):
 
 @app.route('/sms_auto_reply', methods=['POST'])
 def sms_auto_reply():
-    conversations = load_json(STORAGE_FILE)
+    log("📩 Nouvelle requête POST reçue")
 
-    if request.method != 'POST':
-        abort(405)
+    conversations = load_json(STORAGE_FILE)
 
     messages_raw = request.form.get("messages")
     if not messages_raw:
         log("❌ messages_raw manquant")
         return "Requête invalide : messages manquants", 400
+
+    log(f"🔎 messages_raw brut : {messages_raw}")
 
     if not DEBUG_MODE and "X-SG-SIGNATURE" in request.headers:
         signature = request.headers.get("X-SG-SIGNATURE")
@@ -76,7 +77,7 @@ def sms_auto_reply():
 
     try:
         messages = json.loads(messages_raw)
-        log(f"✔️ messages_raw reçu : {messages_raw}")
+        log(f"✔️ JSON messages parsé : {messages}")
     except json.JSONDecodeError:
         log("❌ Format JSON invalide")
         return "Format JSON invalide", 400
@@ -85,9 +86,10 @@ def sms_auto_reply():
         msg_id = msg.get("ID")
         number = msg.get("number")
         device_from_msg = msg.get("device")
+        log(f"🔁 Nouveau message détecté : ID={msg_id}, number={number}, device={device_from_msg}")
 
         if not msg_id or not number or not device_from_msg:
-            log(f"⛔️ Message ignoré : ID={msg_id}, number={number}, device={device_from_msg}")
+            log("⛔️ Champs manquants, message ignoré")
             continue
 
         if number not in conversations:
@@ -96,14 +98,15 @@ def sms_auto_reply():
                 "device": device_from_msg,
                 "processed_ids": []
             }
-            log(f"🆕 Nouvelle conversation avec {number}")
+            log(f"🆕 Création conversation pour {number}")
 
         if msg_id in conversations[number]["processed_ids"]:
-            log(f"🔁 Message déjà traité (ID={msg_id}) pour {number}")
+            log(f"🔁 Message déjà traité pour {number}, ID={msg_id}")
             continue
 
         step = conversations[number]["step"]
         device_id = conversations[number]["device"]
+        log(f"➡️ Étape actuelle : {step} | Device : {device_id}")
 
         if step == 0:
             reply = "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
@@ -118,16 +121,25 @@ def sms_auto_reply():
 
         try:
             send_single_message(number, reply, device_id)
-            log(f"📤 Envoi à {number} via {device_id} : {reply}")
+            log(f"📤 Message envoyé à {number} : {reply}")
         except Exception as e:
-            log(f"❌ Erreur envoi à {number} : {str(e)}")
+            log(f"❌ Erreur lors de l’envoi à {number} : {str(e)}")
 
         conversations[number]["processed_ids"].append(msg_id)
         conversations[number]["processed_ids"] = list(set(conversations[number]["processed_ids"]))[-10:]
 
     save_json(STORAGE_FILE, conversations)
-    log("💾 Conversations sauvegardées")
+    log("💾 Conversations sauvegardées ✅")
     return "✔️ Messages traités avec succès", 200
+
+# ✅ Endpoint de lecture des logs
+@app.route('/logs', methods=['GET'])
+def read_logs():
+    if not os.path.exists(LOG_FILE):
+        return Response("Aucun log trouvé", mimetype='text/plain')
+    with open(LOG_FILE, 'r', encoding='utf-8') as f:
+        content = f.read()
+    return Response(content, mimetype='text/plain')
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
