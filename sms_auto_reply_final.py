@@ -17,6 +17,7 @@ LOG_FILE = '/tmp/log.txt'
 DEBUG_MODE = True
 
 app = Flask(__name__)
+locks = {}  # 🔒 Lock par numéro
 
 def send_request(url, post_data):
     import requests
@@ -59,64 +60,68 @@ def log(text):
         f.write(f"[{datetime.utcnow().isoformat()}] {text}\n")
 
 def process_message(msg):
-    conversations = load_json(STORAGE_FILE)
-    archived = load_json(ARCHIVE_FILE)
-
     msg_id = msg.get("ID")
     number = msg.get("number")
     device_from_msg = msg.get("deviceID")
-
-    log(f"🔁 Traitement : ID={msg_id}, number={number}, device={device_from_msg}")
 
     if not msg_id or not number or not device_from_msg:
         log("⛔️ Champs manquants, message ignoré")
         return
 
-    if number in archived:
-        log(f"🚫 Numéro archivé ignoré : {number}")
-        return
+    if number not in locks:
+        locks[number] = threading.Lock()
 
-    if number not in conversations:
-        conversations[number] = {
-            "step": 0,
-            "device": device_from_msg,
-            "processed_ids": []
-        }
-        log(f"🆕 Conversation créée pour {number}")
+    with locks[number]:
+        conversations = load_json(STORAGE_FILE)
+        archived = load_json(ARCHIVE_FILE)
 
-    if msg_id in conversations[number]["processed_ids"]:
-        log(f"🔁 Déjà traité : {msg_id}")
-        return
+        log(f"🔁 Traitement : ID={msg_id}, number={number}, device={device_from_msg}")
 
-    step = conversations[number]["step"]
-    device_id = conversations[number]["device"]
-    log(f"➡️ Étape : {step} | Device : {device_id}")
+        if number in archived:
+            log(f"🚫 Numéro archivé ignoré : {number}")
+            return
 
-    if step == 0:
-        reply = "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
-        conversations[number]["step"] = 1
-    elif step == 1:
-        reply = "Ok alors choisissez ici votre nouveau créneau ou point relais : https://suivi-coursier.com/183248\nSans ça je peux rien faire, merci et bonne journée."
-        conversations[number]["step"] = 2
-    else:
-        log(f"✅ Fin conversation avec {number}")
-        archived[number] = True
-        conversations.pop(number, None)
+        if number not in conversations:
+            conversations[number] = {
+                "step": 0,
+                "device": device_from_msg,
+                "processed_ids": []
+            }
+            log(f"🆕 Conversation créée pour {number}")
+
+        if msg_id in conversations[number]["processed_ids"]:
+            log(f"🔁 Déjà traité : {msg_id}")
+            return
+
+        step = conversations[number]["step"]
+        device_id = conversations[number]["device"]
+        log(f"➡️ Étape : {step} | Device : {device_id}")
+
+        if step == 0:
+            reply = "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
+            conversations[number]["step"] = 1
+        elif step == 1:
+            reply = "Ok alors choisissez ici votre nouveau créneau ou point relais : https://suivi-coursier.com/183248\nSans ça je peux rien faire, merci et bonne journée."
+            conversations[number]["step"] = 2
+        else:
+            log(f"✅ Fin conversation avec {number}")
+            archived[number] = True
+            conversations.pop(number, None)
+            save_json(STORAGE_FILE, conversations)
+            save_json(ARCHIVE_FILE, archived)
+            return
+
+        try:
+            log("⏳ Attente 30s avant envoi...")
+            time.sleep(30)
+            send_single_message(number, reply, device_id)
+            log(f"📤 Message envoyé à {number} : {reply}")
+        except Exception as e:
+            log(f"❌ Erreur à {number} : {str(e)}")
+
+        conversations[number]["processed_ids"].append(msg_id)
+        conversations[number]["processed_ids"] = list(set(conversations[number]["processed_ids"]))[-10:]
         save_json(STORAGE_FILE, conversations)
-        save_json(ARCHIVE_FILE, archived)
-        return
-
-    try:
-        log("⏳ Attente 30s avant envoi...")
-        time.sleep(30)
-        send_single_message(number, reply, device_id)
-        log(f"📤 Message envoyé à {number} : {reply}")
-    except Exception as e:
-        log(f"❌ Erreur à {number} : {str(e)}")
-
-    conversations[number]["processed_ids"].append(msg_id)
-    conversations[number]["processed_ids"] = list(set(conversations[number]["processed_ids"]))[-10:]
-    save_json(STORAGE_FILE, conversations)
 
 @app.route('/sms_auto_reply', methods=['POST'])
 def sms_auto_reply():
