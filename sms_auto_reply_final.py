@@ -3,7 +3,8 @@ import os
 import hmac
 import hashlib
 import base64
-import time  # ✅ Ajout pour le délai
+import time
+import threading  # ✅ Pour traitement en parallèle
 from flask import Flask, request, abort, Response
 from datetime import datetime
 
@@ -11,8 +12,8 @@ from datetime import datetime
 SERVER = "https://moncolis-attente.com/"
 API_KEY = "f376d32d14b058ed2383b97fd568d1b26de1b75c"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), 'conversations.json')
-LOG_FILE = '/tmp/log.txt'  # ✅ Compatible avec Render
-DEBUG_MODE = True  # Pour ignorer la signature pendant les tests
+LOG_FILE = '/tmp/log.txt'
+DEBUG_MODE = True
 
 app = Flask(__name__)
 
@@ -34,7 +35,7 @@ def send_single_message(number, message, device_slot):
         'message': message,
         'devices': device_slot,
         'type': 'mms',
-        'prioritize': 1,  # ✅ DOIT être un ENTIER
+        'prioritize': 1,
         'key': API_KEY,
     }
     return send_request(f"{SERVER}/services/send.php", post_data)
@@ -56,18 +57,69 @@ def log(text):
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"[{datetime.utcnow().isoformat()}] {text}\n")
 
+def process_message(msg):
+    conversations = load_json(STORAGE_FILE)
+
+    msg_id = msg.get("ID")
+    number = msg.get("number")
+    device_from_msg = msg.get("deviceID")
+
+    log(f"🔁 Traitement : ID={msg_id}, number={number}, device={device_from_msg}")
+
+    if not msg_id or not number or not device_from_msg:
+        log("⛔️ Champs manquants, message ignoré")
+        return
+
+    if number not in conversations:
+        conversations[number] = {
+            "step": 0,
+            "device": device_from_msg,
+            "processed_ids": []
+        }
+        log(f"🆕 Conversation créée pour {number}")
+
+    if msg_id in conversations[number]["processed_ids"]:
+        log(f"🔁 Déjà traité : {msg_id}")
+        return
+
+    step = conversations[number]["step"]
+    device_id = conversations[number]["device"]
+    log(f"➡️ Étape : {step} | Device : {device_id}")
+
+    if step == 0:
+        reply = "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
+        conversations[number]["step"] = 1
+    elif step == 1:
+        reply = "Ok alors choisissez ici votre nouveau créneau ou point relais : https://suivi-coursier.com/183248\nSans ça je peux rien faire, merci et bonne journée."
+        conversations[number]["step"] = 2
+    else:
+        log(f"✅ Fin conversation avec {number}")
+        conversations.pop(number, None)
+        save_json(STORAGE_FILE, conversations)
+        return
+
+    try:
+        log("⏳ Attente 30s avant envoi...")
+        time.sleep(30)
+        send_single_message(number, reply, device_id)
+        log(f"📤 Message envoyé à {number} : {reply}")
+    except Exception as e:
+        log(f"❌ Erreur à {number} : {str(e)}")
+
+    conversations[number]["processed_ids"].append(msg_id)
+    conversations[number]["processed_ids"] = list(set(conversations[number]["processed_ids"]))[-10:]
+    save_json(STORAGE_FILE, conversations)
+
 @app.route('/sms_auto_reply', methods=['POST'])
 def sms_auto_reply():
-    log("📩 Nouvelle requête POST reçue")
-
-    conversations = load_json(STORAGE_FILE)
+    log("📩 Requête POST reçue")
 
     messages_raw = request.form.get("messages")
     if not messages_raw:
         log("❌ messages_raw manquant")
         return "Requête invalide : messages manquants", 400
 
-    log(f"🔎 messages_raw brut : {messages_raw}")
+    log(f"🔎 messages brut : {messages_raw}")
 
     if not DEBUG_MODE and "X-SG-SIGNATURE" in request.headers:
         signature = request.headers.get("X-SG-SIGNATURE")
@@ -78,63 +130,16 @@ def sms_auto_reply():
 
     try:
         messages = json.loads(messages_raw)
-        log(f"✔️ JSON messages parsé : {messages}")
+        log(f"✔️ messages parsés : {messages}")
     except json.JSONDecodeError:
-        log("❌ Format JSON invalide")
+        log("❌ JSON invalide")
         return "Format JSON invalide", 400
 
     for msg in messages:
-        msg_id = msg.get("ID")
-        number = msg.get("number")
-        device_from_msg = msg.get("deviceID")  # ✅ ICI le bon champ
+        thread = threading.Thread(target=process_message, args=(msg,))
+        thread.start()
 
-        log(f"🔁 Nouveau message détecté : ID={msg_id}, number={number}, device={device_from_msg}")
-
-        if not msg_id or not number or not device_from_msg:
-            log("⛔️ Champs manquants, message ignoré")
-            continue
-
-        if number not in conversations:
-            conversations[number] = {
-                "step": 0,
-                "device": device_from_msg,
-                "processed_ids": []
-            }
-            log(f"🆕 Création conversation pour {number}")
-
-        if msg_id in conversations[number]["processed_ids"]:
-            log(f"🔁 Message déjà traité pour {number}, ID={msg_id}")
-            continue
-
-        step = conversations[number]["step"]
-        device_id = conversations[number]["device"]
-        log(f"➡️ Étape actuelle : {step} | Device : {device_id}")
-
-        if step == 0:
-            reply = "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
-            conversations[number]["step"] = 1
-        elif step == 1:
-            reply = "Ok alors choisissez ici votre nouveau créneau ou point relais : https://suivi-coursier.com/183248\nSans ça je peux rien faire, merci et bonne journée."
-            conversations[number]["step"] = 2
-        else:
-            log(f"✅ Fin de conversation avec {number}")
-            conversations.pop(number, None)
-            continue
-
-        try:
-            log("⏳ Attente de 60 secondes avant l’envoi...")
-            time.sleep(60)  # ✅ Délai de 1 minute
-            send_single_message(number, reply, device_id)
-            log(f"📤 Message envoyé à {number} : {reply}")
-        except Exception as e:
-            log(f"❌ Erreur lors de l’envoi à {number} : {str(e)}")
-
-        conversations[number]["processed_ids"].append(msg_id)
-        conversations[number]["processed_ids"] = list(set(conversations[number]["processed_ids"]))[-10:]
-
-    save_json(STORAGE_FILE, conversations)
-    log("💾 Conversations sauvegardées ✅")
-    return "✔️ Messages traités avec succès", 200
+    return "✔️ Messages en cours de traitement", 200
 
 @app.route('/logs', methods=['GET'])
 def read_logs():
