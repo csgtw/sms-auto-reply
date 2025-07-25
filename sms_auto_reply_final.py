@@ -4,7 +4,7 @@ import hmac
 import hashlib
 import base64
 import time
-import threading  # ✅ Pour traitement en parallèle
+import threading
 from flask import Flask, request, abort, Response
 from datetime import datetime
 
@@ -12,6 +12,7 @@ from datetime import datetime
 SERVER = "https://moncolis-attente.com/"
 API_KEY = "f376d32d14b058ed2383b97fd568d1b26de1b75c"
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), 'conversations.json')
+ARCHIVE_FILE = os.path.join(os.path.dirname(__file__), 'archived_numbers.json')
 LOG_FILE = '/tmp/log.txt'
 DEBUG_MODE = True
 
@@ -59,6 +60,7 @@ def log(text):
 
 def process_message(msg):
     conversations = load_json(STORAGE_FILE)
+    archived = load_json(ARCHIVE_FILE)
 
     msg_id = msg.get("ID")
     number = msg.get("number")
@@ -68,6 +70,10 @@ def process_message(msg):
 
     if not msg_id or not number or not device_from_msg:
         log("⛔️ Champs manquants, message ignoré")
+        return
+
+    if number in archived:
+        log(f"🚫 Numéro archivé ignoré : {number}")
         return
 
     if number not in conversations:
@@ -94,8 +100,10 @@ def process_message(msg):
         conversations[number]["step"] = 2
     else:
         log(f"✅ Fin conversation avec {number}")
+        archived[number] = True
         conversations.pop(number, None)
         save_json(STORAGE_FILE, conversations)
+        save_json(ARCHIVE_FILE, archived)
         return
 
     try:
