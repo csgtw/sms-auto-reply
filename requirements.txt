@@ -3,3 +3,4 @@ rq==2.4.1
 redis==4.5.5
 requests
 gunicorn
+rq-scheduler
