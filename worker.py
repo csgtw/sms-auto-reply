@@ -5,6 +5,9 @@ from rq.serializers import JSONSerializer
 from rq.worker import Worker
 from logger import log
 
+from datetime import datetime
+print("🕒 Heure actuelle UTC :", datetime.utcnow())
+
 # ✅ Test d'import de tasks.py
 try:
     from tasks import process_message
