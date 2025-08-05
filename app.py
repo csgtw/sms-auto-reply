@@ -10,6 +10,7 @@ from rq import Queue
 from rq.serializers import JSONSerializer
 from tasks import process_message
 from logger import log
+from datetime import timedelta
 
 API_KEY = os.getenv("API_KEY")
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -67,7 +68,7 @@ def sms_auto_reply():
     # ✅ Mise en file
     for i, msg in enumerate(messages):
         try:
-            job = queue.enqueue(process_message, json.dumps(msg))
+            q.enqueue_in(timedelta(minutes=2), process_message, json.dumps(msg))
             log(f"[{request_id}] ➡️ Mise en file {i} : {msg} ✅ job.id: {job.id}")
         except Exception as e:
             log(f"[{request_id}] ❌ Erreur file {i} : {e}")
