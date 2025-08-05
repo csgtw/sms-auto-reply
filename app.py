@@ -18,16 +18,13 @@ LOG_FILE = "/tmp/log.txt"
 
 app = Flask(__name__)
 
-# ✅ Connexion Redis
 REDIS_URL = os.getenv("REDIS_URL")
 redis_conn = Redis.from_url(REDIS_URL)
-
-# ✅ Queue RQ nommée "default"
 queue = Queue("default", connection=redis_conn, serializer=JSONSerializer)
 
 @app.route('/sms_auto_reply', methods=['POST'])
 def sms_auto_reply():
-    request_id = str(uuid.uuid4())[:8]  # pour suivre les logs
+    request_id = str(uuid.uuid4())[:8]
     log(f"\n📩 [{request_id}] Nouvelle requête POST reçue")
 
     messages_raw = request.form.get("messages")
@@ -37,7 +34,6 @@ def sms_auto_reply():
 
     log(f"[{request_id}] 🔎 messages brut : {messages_raw}")
 
-    # ✅ Vérification de signature si non en DEBUG
     if not DEBUG_MODE:
         signature = request.headers.get("X-SG-SIGNATURE")
         if not signature:
@@ -53,7 +49,6 @@ def sms_auto_reply():
             return "Signature invalide", 403
         log(f"[{request_id}] ✅ Signature valide")
 
-    # ✅ Parsing JSON
     try:
         messages = json.loads(messages_raw)
         log(f"[{request_id}] ✔️ messages parsés : {messages}")
@@ -65,10 +60,9 @@ def sms_auto_reply():
         log(f"[{request_id}] ❌ Format JSON non liste")
         return "Liste attendue", 400
 
-    # ✅ Mise en file
     for i, msg in enumerate(messages):
         try:
-            q.enqueue_in(timedelta(minutes=2), process_message, json.dumps(msg))
+            job = queue.enqueue_in(timedelta(minutes=2), process_message, json.dumps(msg))
             log(f"[{request_id}] ➡️ Mise en file {i} : {msg} ✅ job.id: {job.id}")
         except Exception as e:
             log(f"[{request_id}] ❌ Erreur file {i} : {e}")
