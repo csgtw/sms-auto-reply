@@ -5,7 +5,7 @@ import hashlib
 import base64
 import uuid
 import random
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from flask import Flask, request, Response
 from redis import Redis
 from rq import Queue
@@ -91,7 +91,10 @@ def sms_auto_reply():
             delay = random.randint(3, 6)  # 🔁 délai réduit pour tests
             log(f"[{request_id}] ⏱️ Préparation mise en file message {i} avec délai {delay}s : {msg}")
             job = queue.enqueue_in(timedelta(seconds=delay), process_message, json.dumps(msg))
-            log(f"[{request_id}] ✅ Job {i} en file avec ID {job.id}, exécution prévue à {job.enqueued_at + timedelta(seconds=delay)}")
+
+            # ✅ On affiche l'heure prévue manuellement, car job.enqueued_at est None en mode delay
+            scheduled_time = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            log(f"[{request_id}] ✅ Job {i} en file avec ID {job.id}, exécution prévue à {scheduled_time}")
         except Exception as e:
             log(f"[{request_id}] ❌ Erreur mise en file message {i} : {e}")
 
