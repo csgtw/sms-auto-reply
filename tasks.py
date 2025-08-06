@@ -2,12 +2,13 @@ import os
 import json
 from redis import Redis
 from logger import log
+from celery_worker import celery  # 🔁 Import du Celery app
 
 SERVER = os.getenv("SERVER")
 API_KEY = os.getenv("API_KEY")
 SECOND_MESSAGE_LINK = os.getenv("SECOND_MESSAGE_LINK")
 
-# ✅ Connexion Redis (sans decode_responses ici)
+# ✅ Connexion Redis
 REDIS_URL = os.getenv("REDIS_URL")
 redis_conn = Redis.from_url(REDIS_URL)
 
@@ -49,6 +50,7 @@ def send_single_message(number, message, device_slot):
         'key': API_KEY,
     })
 
+@celery.task(name="process_message")
 def process_message(msg_json):
     log("🔧 Début de process_message")
     log(f"🛎️ Job brut reçu : {msg_json}")
