@@ -85,10 +85,10 @@ def sms_auto_reply():
         log(f"[{request_id}] ❌ Format JSON non liste (type: {type(messages)})")
         return "Liste attendue", 400
 
-    # Mise en file avec délai aléatoire entre 1 et 3 minutes
+    # Mise en file avec délai aléatoire entre 3 et 6 secondes (pour test uniquement)
     for i, msg in enumerate(messages):
         try:
-            delay = random.randint(60, 180)
+            delay = random.randint(3, 6)  # 🔁 délai réduit pour tests
             log(f"[{request_id}] ⏱️ Préparation mise en file message {i} avec délai {delay}s : {msg}")
             job = queue.enqueue_in(timedelta(seconds=delay), process_message, json.dumps(msg))
             log(f"[{request_id}] ✅ Job {i} en file avec ID {job.id}, exécution prévue à {job.enqueued_at + timedelta(seconds=delay)}")
