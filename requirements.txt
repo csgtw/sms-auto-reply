@@ -1,6 +1,5 @@
 Flask==3.1.1
-rq==1.15.1
-rq-scheduler==0.13.1
+rq==2.4.1
 redis==4.5.5
-requests
-gunicorn
+requests==2.31.0
+gunicorn==21.2.0
