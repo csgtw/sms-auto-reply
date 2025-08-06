@@ -1,10 +1,8 @@
 import os
 from celery import Celery
-from dotenv import load_dotenv
 from logger import log
 
-# Chargement des variables d’environnement (.env local ou Render)
-load_dotenv()
+
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
