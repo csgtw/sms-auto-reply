@@ -1,18 +1,14 @@
 import os
 from celery import Celery
 from logger import log
-from dotenv import load_dotenv
-
-# Charger les variables d’environnement (local + Render)
-load_dotenv()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# ⚙️ SSL config si rediss://
+# 🔒 Gérer SSL si rediss:// est utilisé
 ssl_options = {}
 if REDIS_URL.startswith("rediss://"):
     ssl_options = {
-        "ssl_cert_reqs": "none"  # Tu peux mettre "required" si tu as les certificats
+        "ssl_cert_reqs": "none"  # Pour Upstash, aucun certificat requis
     }
 
 # ✅ Initialisation de Celery
@@ -23,7 +19,6 @@ celery = Celery(
     include=["tasks"]
 )
 
-# Configuration Celery
 celery.conf.update(
     timezone="UTC",
     enable_utc=True,
