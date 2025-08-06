@@ -5,7 +5,6 @@ import hashlib
 import base64
 import uuid
 import random
-from datetime import timedelta
 from flask import Flask, request, Response
 from redis import Redis
 from tasks import process_message
@@ -62,10 +61,10 @@ def sms_auto_reply():
         log(f"[{request_id}] ❌ Format JSON non liste")
         return "Liste attendue", 400
 
-    # ✅ Mise en file Celery avec délai aléatoire (3 à 6 sec pour test)
+    # ✅ Mise en file Celery avec délai aléatoire (60 à 180 sec)
     for i, msg in enumerate(messages):
         try:
-            delay = random.randint(3, 6)
+            delay = random.randint(60, 180)
             log(f"[{request_id}] ⏱️ Mise en file message {i} avec délai {delay}s")
             result = process_message.apply_async(args=[json.dumps(msg)], countdown=delay)
             log(f"[{request_id}] ✅ Job {i} Celery ID : {result.id}")
