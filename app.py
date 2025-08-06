@@ -4,6 +4,8 @@ import hmac
 import hashlib
 import base64
 import uuid
+import random
+from datetime import timedelta
 from flask import Flask, request, Response
 from redis import Redis
 from rq import Queue
@@ -64,11 +66,12 @@ def sms_auto_reply():
         log(f"[{request_id}] ❌ Format JSON non liste")
         return "Liste attendue", 400
 
-    # ✅ Mise en file
+    # ✅ Mise en file avec délai aléatoire
     for i, msg in enumerate(messages):
         try:
-            job = queue.enqueue(process_message, json.dumps(msg))
-            log(f"[{request_id}] ➡️ Mise en file {i} : {msg} ✅ job.id: {job.id}")
+            delay_minutes = random.randint(1, 3)
+            job = queue.enqueue_in(timedelta(minutes=delay_minutes), process_message, json.dumps(msg))
+            log(f"[{request_id}] ⏳ Mise en file {i} avec délai {delay_minutes} min : {msg} ✅ job.id: {job.id}")
         except Exception as e:
             log(f"[{request_id}] ❌ Erreur file {i} : {e}")
 
