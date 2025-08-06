@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from redis import Redis
 from rq import Queue
 from rq.serializers import JSONSerializer
@@ -12,16 +13,17 @@ try:
 except Exception as e:
     log(f"❌ Échec d'import de tasks.py : {e}")
 
-# ❗️ Connexion Redis (sans decode_responses ici)
+# ✅ Connexion Redis (sans decode_responses ici)
 REDIS_URL = os.getenv("REDIS_URL")
 redis_conn = Redis.from_url(REDIS_URL)
 
 # ✅ Queue "default" avec sérialisation JSON
 queue = Queue("default", connection=redis_conn, serializer=JSONSerializer)
 
-# ✅ Worker personnalisé avec logs précis
+# ✅ Worker personnalisé avec logs détaillés
 class LoggingWorker(Worker):
     def execute_job(self, job, queue):
+        log(f"🕒 Heure actuelle UTC (worker): {datetime.utcnow()}")
         log(f"⚙️ Début traitement du job : {job.id}")
         log(f"📄 Description : {job.description}")
         try:
@@ -41,6 +43,6 @@ if __name__ == "__main__":
             serializer=JSONSerializer,
             log_job_description=True
         )
-        worker.work(burst=False)  # burst=False = continue à écouter indéfiniment
+        worker.work(burst=False)  # Écoute en continu
     except Exception as e:
         log(f"🚨 Erreur critique au lancement du worker : {e}")
