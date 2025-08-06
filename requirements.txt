@@ -3,3 +3,4 @@ rq==2.4.1
 redis==4.5.5
 requests==2.31.0
 gunicorn==21.2.0
+rq-scheduler==0.13.1
