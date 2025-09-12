@@ -87,7 +87,7 @@ def process_message(msg_json):
         log(f"📊 [{msg_id_short}] Étape actuelle : {step}")
 
         if step == 0:
-            reply = "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
+            reply = "Pardon c’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
             redis_conn.hset(conv_key, "step", 1)
             log(f"📤 [{msg_id_short}] Réponse étape 0 envoyée.")
         elif step == 1:
