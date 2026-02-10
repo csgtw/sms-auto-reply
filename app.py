@@ -11,9 +11,7 @@ from flask import Flask, request, Response, redirect, url_for, session, render_t
 from redis import Redis
 
 from logger import log
-from celery_worker import celery
 from tasks import process_message
-
 
 API_KEY = os.getenv("API_KEY")
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -22,11 +20,11 @@ LOG_FILE = "/tmp/log.txt"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY", "")
 
+SERVER = os.getenv("SERVER")
 REDIS_URL = os.getenv("REDIS_URL")
 redis_conn = Redis.from_url(REDIS_URL)
 
 CONFIG_KEY = "config:autoreply"
-
 
 app = Flask(__name__)
 app.secret_key = APP_SECRET_KEY or os.urandom(32)
@@ -43,13 +41,12 @@ def _require_login():
 
 
 def _get_config_defaults():
-    # ✅ defaults vides : tout se configure via l’UI
+    # ✅ Defaults vides : tout se configure ici
     return {
         "enabled": True,
-        "reply_mode": 2,
-        "min_in_before_reply": 1,
-        "step0_type": "sms",
-        "step1_type": "sms",
+        "reply_mode": 2,        # 1 ou 2
+        "step0_type": "sms",    # sms|mms
+        "step1_type": "sms",    # sms|mms
         "step0_text": "",
         "step1_text": "",
     }
@@ -60,20 +57,22 @@ def load_config():
     defaults = _get_config_defaults()
     if not raw:
         return defaults
+
     try:
         cfg = json.loads(raw.decode("utf-8"))
         if not isinstance(cfg, dict):
             return defaults
+
         defaults.update(cfg)
 
-        # normalisation
         defaults["enabled"] = bool(defaults.get("enabled", True))
         defaults["reply_mode"] = 1 if int(defaults.get("reply_mode", 2)) == 1 else 2
-        defaults["min_in_before_reply"] = max(1, int(defaults.get("min_in_before_reply", 1)))
+
         if defaults.get("step0_type") not in ("sms", "mms"):
             defaults["step0_type"] = "sms"
         if defaults.get("step1_type") not in ("sms", "mms"):
             defaults["step1_type"] = "sms"
+
         defaults["step0_text"] = str(defaults.get("step0_text") or "")
         defaults["step1_text"] = str(defaults.get("step1_text") or "")
 
@@ -84,6 +83,50 @@ def load_config():
 
 def save_config(cfg: dict):
     redis_conn.set(CONFIG_KEY, json.dumps(cfg, ensure_ascii=False))
+
+
+def _redis_int(key: str) -> int:
+    try:
+        return int(redis_conn.get(key) or 0)
+    except Exception:
+        return 0
+
+
+def _device_stats(device_id: str):
+    base = f"stats:device:{device_id}:"
+    return {
+        "device_id": device_id,
+        "received": _redis_int(base + "received"),
+        "sent": _redis_int(base + "sent"),
+        "errors": _redis_int(base + "errors"),
+        "last_seen": _redis_int(base + "last_seen"),
+        "cycle": _redis_int(f"cycle:device:{device_id}:index"),
+        "cycle_sent": _redis_int(f"cycle:device:{device_id}:sent"),
+        "cycle_received": _redis_int(f"cycle:device:{device_id}:received"),
+    }
+
+
+def fetch_gateway_devices():
+    """
+    ✅ Liste tous les devices du Gateway même si aucun SMS reçu.
+    Endpoint confirmé dans ton Gateway : /services/get-devices.php
+    """
+    import requests
+
+    if not SERVER or not API_KEY:
+        return []
+
+    url = f"{SERVER}/services/get-devices.php"
+    try:
+        r = requests.get(url, params={"key": API_KEY}, timeout=12)
+        data = r.json()
+        if not data.get("success"):
+            return []
+        devices = (data.get("data") or {}).get("devices") or []
+        return devices
+    except Exception as e:
+        log(f"❌ fetch_gateway_devices error: {e}")
+        return []
 
 
 # -----------------------
@@ -106,17 +149,17 @@ def admin_login():
   <title>Login</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    :root { --bg:#0b0f1a; --card:#121a2a; --muted:#8aa0c7; --txt:#e8eefc; --line:#22304a; --btn:#2d6cdf; }
+    :root{--bg:#070a12;--card:#121a2a;--line:#22304a;--txt:#e8eefc;--muted:#8aa0c7;--btn:#2d6cdf;}
     body{margin:0;background:linear-gradient(180deg,#070a12 0%, #0b0f1a 100%);color:var(--txt);font-family:Arial;}
     .wrap{max-width:520px;margin:0 auto;padding:22px;}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:30px;}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;margin-top:34px;}
     label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
     input{
       width:100%;box-sizing:border-box;background:#0e1626;border:1px solid var(--line);
-      color:var(--txt);padding:10px;border-radius:10px;outline:none;
+      color:var(--txt);padding:12px;border-radius:12px;outline:none;
     }
-    .btn{background:var(--btn);border:0;color:white;padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:700;margin-top:12px;width:100%}
-    h2{margin:0 0 10px 0}
+    .btn{background:var(--btn);border:0;color:white;padding:12px 14px;border-radius:12px;cursor:pointer;font-weight:800;margin-top:12px;width:100%}
+    h2{margin:0 0 8px 0}
     .muted{color:var(--muted);font-size:12px}
   </style>
 </head>
@@ -143,11 +186,26 @@ def admin_logout():
     return redirect(url_for("admin_login"))
 
 
-@app.route("/admin")
+@app.route("/admin", methods=["GET"])
 def admin_home():
     guard = _require_login()
     if guard:
         return guard
+    return redirect(url_for("admin_settings"))
+
+
+@app.route("/admin/devices/<device_id>/next_cycle", methods=["POST"])
+def admin_next_cycle(device_id):
+    guard = _require_login()
+    if guard:
+        return guard
+
+    device_id = str(device_id)
+    new_cycle = redis_conn.incr(f"cycle:device:{device_id}:index")
+    redis_conn.set(f"cycle:device:{device_id}:sent", 0)
+    redis_conn.set(f"cycle:device:{device_id}:received", 0)
+
+    log(f"🔁 Cycle suivant (manuel) device={device_id} -> cycle={new_cycle}")
     return redirect(url_for("admin_settings"))
 
 
@@ -162,7 +220,6 @@ def admin_settings():
     if request.method == "POST":
         enabled = request.form.get("enabled") == "on"
         reply_mode = int(request.form.get("reply_mode") or 2)
-        min_in_before_reply = int(request.form.get("min_in_before_reply") or 1)
 
         step0_type = (request.form.get("step0_type") or "sms").strip().lower()
         step1_type = (request.form.get("step1_type") or "sms").strip().lower()
@@ -172,21 +229,18 @@ def admin_settings():
 
         if reply_mode not in (1, 2):
             reply_mode = 2
-        if min_in_before_reply < 1:
-            min_in_before_reply = 1
         if step0_type not in ("sms", "mms"):
             step0_type = "sms"
         if step1_type not in ("sms", "mms"):
             step1_type = "sms"
 
-        # ✅ ergonomie : si mode 1 réponse, on vide step1
+        # ✅ Si mode 1 réponse : on supprime/ignore Step 1
         if reply_mode == 1:
             step1_text = ""
 
         cfg.update({
             "enabled": enabled,
             "reply_mode": reply_mode,
-            "min_in_before_reply": min_in_before_reply,
             "step0_type": step0_type,
             "step1_type": step1_type,
             "step0_text": step0_text,
@@ -195,74 +249,157 @@ def admin_settings():
         save_config(cfg)
         return redirect(url_for("admin_settings"))
 
+    # ✅ Devices du gateway (tous) + stats redis
+    gw_devices = fetch_gateway_devices()
+    rows = []
+    for d in gw_devices:
+        did = str(d.get("id"))
+        s = _device_stats(did)
+        s.update({
+            "name": d.get("name") or "",
+            "model": d.get("model") or "",
+            "androidVersion": d.get("androidVersion") or "",
+            "appVersion": d.get("appVersion") or "",
+            "lastSeenAt": d.get("lastSeenAt") or "",
+        })
+        rows.append(s)
+
+    now = int(time.time())
+
     return render_template_string("""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Settings</title>
+  <title>Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    :root { --bg:#0b0f1a; --card:#121a2a; --muted:#8aa0c7; --txt:#e8eefc; --line:#22304a; --btn:#2d6cdf; --bad:#ff5c7a; }
-    body{margin:0;background:linear-gradient(180deg,#070a12 0%, #0b0f1a 100%);color:var(--txt);font-family:Arial;}
-    .wrap{max-width:980px;margin:0 auto;padding:22px;}
-    .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;}
-    .top h2{margin:0;font-size:20px;}
-    a{color:#9bc1ff;text-decoration:none}
-    .nav{display:flex;gap:12px;align-items:center}
-    .grid{display:grid;grid-template-columns:1fr;gap:12px;}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;}
-    .row{display:flex;gap:12px;flex-wrap:wrap}
-    label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
-    input[type="number"], select, textarea{
-      width:100%;box-sizing:border-box;background:#0e1626;border:1px solid var(--line);
-      color:var(--txt);padding:10px;border-radius:10px;outline:none;
+    :root{
+      --bg:#070a12; --card:#121a2a; --line:#22304a; --txt:#e8eefc; --muted:#8aa0c7;
+      --btn:#2d6cdf; --btn2:#0e1626; --good:#24d18f;
     }
-    textarea{min-height:92px;resize:vertical}
-    .btn{background:var(--btn);border:0;color:white;padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:700}
-    .pill{display:inline-flex;align-items:center;gap:10px;background:#0e1626;border:1px solid var(--line);padding:10px 12px;border-radius:12px}
+    body{margin:0;background:linear-gradient(180deg,#070a12 0%, #0b0f1a 100%);color:var(--txt);font-family:Arial;}
+    .wrap{max-width:1200px;margin:0 auto;padding:18px;}
+    .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;}
+    .top h2{margin:0;font-size:18px;}
+    a{color:#9bc1ff;text-decoration:none;font-weight:700}
+    .grid{display:grid;grid-template-columns:1fr;gap:12px;}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;}
     .muted{color:var(--muted);font-size:12px}
-    .sep{height:1px;background:var(--line);margin:14px 0}
+    .title{font-weight:900;margin-bottom:10px}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+    label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+    textarea, select{
+      width:100%;box-sizing:border-box;background:#0e1626;border:1px solid var(--line);
+      color:var(--txt);padding:12px;border-radius:12px;outline:none;
+    }
+    textarea{min-height:90px;resize:vertical}
+    select{appearance:none;background-image:
+      linear-gradient(45deg,transparent 50%,#9bc1ff 50%),
+      linear-gradient(135deg,#9bc1ff 50%,transparent 50%);
+      background-position: calc(100% - 18px) calc(50% - 3px), calc(100% - 12px) calc(50% - 3px);
+      background-size: 6px 6px, 6px 6px;
+      background-repeat:no-repeat;
+    }
+    .btn{background:var(--btn);border:0;color:white;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900}
+    .btn2{background:var(--btn2);border:1px solid var(--line);color:#cfe0ff;padding:9px 12px;border-radius:12px;cursor:pointer;font-weight:900}
+    .pill{display:inline-flex;gap:8px;align-items:center;background:#0e1626;border:1px solid var(--line);padding:10px 12px;border-radius:14px}
+    .dot{width:9px;height:9px;border-radius:99px;background:var(--good)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
+    th{color:var(--muted);font-weight:900}
     .hide{display:none}
-    .title{font-weight:700;margin-bottom:10px}
-    code{background:#0e1626;padding:2px 6px;border-radius:8px;border:1px solid var(--line)}
+    code{background:#0e1626;padding:2px 6px;border-radius:10px;border:1px solid var(--line)}
   </style>
 </head>
-
 <body>
   <div class="wrap">
     <div class="top">
-      <h2>Auto-reply • Settings</h2>
-      <div class="nav">
-        <a href="/admin/devices">Devices</a>
+      <h2>Panneau de contrôle</h2>
+      <div style="display:flex;gap:12px;align-items:center">
+        <a href="/logs" target="_blank">Logs</a>
         <a href="/admin/logout">Logout</a>
       </div>
     </div>
 
-    <form method="post" class="grid">
+    <!-- DEVICES en haut -->
+    <div class="card">
+      <div class="title">Appareils (Gateway)</div>
+      <div class="muted" style="margin-bottom:10px">
+        Liste complète via <code>/services/get-devices.php</code>. Stats (reçus/envoyés/erreurs) calculées depuis Redis.
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Device</th>
+            <th>Nom / Modèle</th>
+            <th>Reçus</th>
+            <th>Envoyés</th>
+            <th>Erreurs</th>
+            <th>Cycle</th>
+            <th>Reçus cycle</th>
+            <th>Envoyés cycle</th>
+            <th>Dernier vu (Gateway)</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if rows|length == 0 %}
+            <tr><td colspan="10" class="muted">Aucun device remonté par le Gateway (vérifie SERVER/API_KEY).</td></tr>
+          {% endif %}
+          {% for r in rows %}
+            <tr>
+              <td>
+                <div class="pill">
+                  <span class="dot"></span>
+                  <span style="font-weight:900">#{{ r.device_id }}</span>
+                </div>
+              </td>
+              <td>
+                <div style="font-weight:900">{{ r.name }}</div>
+                <div class="muted">{{ r.model }} • Android {{ r.androidVersion }} • App {{ r.appVersion }}</div>
+              </td>
+              <td>{{ r.received }}</td>
+              <td>{{ r.sent }}</td>
+              <td>{{ r.errors }}</td>
+              <td>{{ r.cycle }}</td>
+              <td>{{ r.cycle_received }}</td>
+              <td>{{ r.cycle_sent }}</td>
+              <td class="muted">{{ r.lastSeenAt or "—" }}</td>
+              <td>
+                <form method="post" action="/admin/devices/{{ r.device_id }}/next_cycle" style="margin:0">
+                  <button class="btn2" type="submit">Cycle suivant</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- SETTINGS -->
+    <form method="post" class="grid" style="margin-top:12px">
 
       <div class="card">
-        <div class="row" style="align-items:center;justify-content:space-between">
+        <div class="title">Auto-reply</div>
+
+        <div class="row" style="justify-content:space-between">
           <div class="pill">
             <input id="enabled" type="checkbox" name="enabled" {% if cfg.enabled %}checked{% endif %}>
             <div>
-              <div style="font-weight:700">Activé</div>
+              <div style="font-weight:900">Activé</div>
               <div class="muted">Désactive toutes les réponses</div>
             </div>
           </div>
 
-          <div style="min-width:260px">
+          <div style="min-width:260px;flex:1;max-width:320px">
             <label>Mode</label>
             <select id="reply_mode" name="reply_mode">
-              <option value="1" {% if cfg.reply_mode == 1 %}selected{% endif %}>1 réponse</option>
-              <option value="2" {% if cfg.reply_mode == 2 %}selected{% endif %}>2 réponses</option>
+              <option value="1" {% if cfg.reply_mode == 1 %}selected{% endif %}>1 réponse (puis stop)</option>
+              <option value="2" {% if cfg.reply_mode == 2 %}selected{% endif %}>2 réponses (puis stop)</option>
             </select>
-          </div>
-
-          <div style="min-width:300px">
-            <label>Répondre après N messages entrants (par numéro)</label>
-            <input type="number" min="1" name="min_in_before_reply" value="{{ cfg.min_in_before_reply }}">
-            <div class="muted">Ex: 2 = pas de réponse au 1er message, réponse à partir du 2e</div>
+            <div class="muted">Après la dernière réponse, le numéro est archivé et ne recevra plus rien.</div>
           </div>
         </div>
       </div>
@@ -270,7 +407,7 @@ def admin_settings():
       <div class="card">
         <div class="title">Step 0</div>
         <div class="row">
-          <div style="flex:1;min-width:240px">
+          <div style="min-width:220px;flex:1;max-width:320px">
             <label>Type</label>
             <select name="step0_type">
               <option value="sms" {% if cfg.step0_type == 'sms' %}selected{% endif %}>sms</option>
@@ -287,7 +424,7 @@ def admin_settings():
       <div id="step1_block" class="card">
         <div class="title">Step 1</div>
         <div class="row">
-          <div style="flex:1;min-width:240px">
+          <div style="min-width:220px;flex:1;max-width:320px">
             <label>Type</label>
             <select name="step1_type">
               <option value="sms" {% if cfg.step1_type == 'sms' %}selected{% endif %}>sms</option>
@@ -308,7 +445,6 @@ def admin_settings():
           Webhook inchangé : <code>/sms_auto_reply</code>
         </div>
       </div>
-
     </form>
   </div>
 
@@ -324,157 +460,7 @@ def admin_settings():
   </script>
 </body>
 </html>
-""", cfg=cfg)
-
-
-def _device_stats(device_id: str):
-    base = f"stats:device:{device_id}:"
-    received = int(redis_conn.get(base + "received") or 0)
-    sent = int(redis_conn.get(base + "sent") or 0)
-    errors = int(redis_conn.get(base + "errors") or 0)
-    last_seen = int(redis_conn.get(base + "last_seen") or 0)
-
-    cycle = int(redis_conn.get(f"cycle:device:{device_id}:index") or 0)
-    cycle_sent = int(redis_conn.get(f"cycle:device:{device_id}:sent") or 0)
-    cycle_received = int(redis_conn.get(f"cycle:device:{device_id}:received") or 0)
-
-    return {
-        "device_id": device_id,
-        "received": received,
-        "sent": sent,
-        "errors": errors,
-        "last_seen": last_seen,
-        "cycle": cycle,
-        "cycle_sent": cycle_sent,
-        "cycle_received": cycle_received,
-    }
-
-
-@app.route("/admin/devices", methods=["GET"])
-def admin_devices():
-    guard = _require_login()
-    if guard:
-        return guard
-
-    # devices connus : on les apprend en recevant des webhooks
-    device_ids = []
-    try:
-        raw = redis_conn.smembers("devices:seen")
-        device_ids = sorted([x.decode("utf-8") for x in raw])
-    except Exception:
-        device_ids = []
-
-    rows = [_device_stats(d) for d in device_ids]
-
-    now = int(time.time())
-
-    return render_template_string("""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Devices</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    :root { --bg:#0b0f1a; --card:#121a2a; --muted:#8aa0c7; --txt:#e8eefc; --line:#22304a; --btn:#2d6cdf; --btn2:#1f2b44; }
-    body{margin:0;background:linear-gradient(180deg,#070a12 0%, #0b0f1a 100%);color:var(--txt);font-family:Arial;}
-    .wrap{max-width:1100px;margin:0 auto;padding:22px;}
-    .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;}
-    .top h2{margin:0;font-size:20px;}
-    a{color:#9bc1ff;text-decoration:none}
-    .nav{display:flex;gap:12px;align-items:center}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;}
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
-    th{color:var(--muted);font-weight:700}
-    .muted{color:var(--muted);font-size:12px}
-    .btn{background:var(--btn);border:0;color:white;padding:8px 10px;border-radius:10px;cursor:pointer;font-weight:700}
-    .btn2{background:var(--btn2);border:1px solid var(--line);color:#cfe0ff;padding:8px 10px;border-radius:10px;cursor:pointer;font-weight:700}
-    .pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#0e1626;border:1px solid var(--line);color:#cfe0ff;font-size:12px}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <h2>Devices</h2>
-      <div class="nav">
-        <a href="/admin/settings">Settings</a>
-        <a href="/admin/logout">Logout</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="muted" style="margin-bottom:10px">
-        Liste basée sur les devices vus via webhooks (devices:seen). Le bouton “Cycle suivant” est manuel.
-      </div>
-
-      <table>
-        <thead>
-          <tr>
-            <th>Device</th>
-            <th>Reçus</th>
-            <th>Envoyés</th>
-            <th>Erreurs</th>
-            <th>Cycle</th>
-            <th>Reçus cycle</th>
-            <th>Envoyés cycle</th>
-            <th>Dernier vu</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% if rows|length == 0 %}
-            <tr><td colspan="9" class="muted">Aucun device vu pour le moment. Dès qu’un SMS arrive, il apparaîtra ici.</td></tr>
-          {% endif %}
-
-          {% for r in rows %}
-            <tr>
-              <td><span class="pill">{{ r.device_id }}</span></td>
-              <td>{{ r.received }}</td>
-              <td>{{ r.sent }}</td>
-              <td>{{ r.errors }}</td>
-              <td>{{ r.cycle }}</td>
-              <td>{{ r.cycle_received }}</td>
-              <td>{{ r.cycle_sent }}</td>
-              <td class="muted">
-                {% if r.last_seen == 0 %}
-                  —
-                {% else %}
-                  {{ (now - r.last_seen) }}s
-                {% endif %}
-              </td>
-              <td>
-                <form method="post" action="/admin/devices/{{ r.device_id }}/next_cycle" style="margin:0">
-                  <button class="btn" type="submit">Cycle suivant</button>
-                </form>
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-
-    </div>
-  </div>
-</body>
-</html>
-""", rows=rows, now=now)
-
-
-@app.route("/admin/devices/<device_id>/next_cycle", methods=["POST"])
-def admin_next_cycle(device_id):
-    guard = _require_login()
-    if guard:
-        return guard
-
-    # ✅ incrémente cycle manuellement (pas d’envoi automatique ici)
-    redis_conn.sadd("devices:seen", device_id)
-
-    new_cycle = redis_conn.incr(f"cycle:device:{device_id}:index")
-    redis_conn.set(f"cycle:device:{device_id}:sent", 0)
-    redis_conn.set(f"cycle:device:{device_id}:received", 0)
-
-    log(f"🔁 Cycle suivant (manuel) device={device_id} -> cycle={new_cycle}")
-    return redirect(url_for("admin_devices"))
+""", cfg=cfg, rows=rows, now=now)
 
 
 # -----------------------
@@ -492,7 +478,6 @@ def sms_auto_reply():
 
     log(f"[{request_id}] 🔎 messages brut : {messages_raw}")
 
-    # ✅ Signature
     if not DEBUG_MODE:
         signature = request.headers.get("X-SG-SIGNATURE")
         if not signature:
@@ -504,12 +489,11 @@ def sms_auto_reply():
         ).decode()
 
         if signature != expected_hash:
-            log(f"[{request_id}] ❌ Signature invalide (reçue: {signature})")
+            log(f"[{request_id}] ❌ Signature invalide")
             return "Signature invalide", 403
 
         log(f"[{request_id}] ✅ Signature valide")
 
-    # ✅ Parsing JSON
     try:
         messages = json.loads(messages_raw)
         log(f"[{request_id}] ✔️ messages parsés : {messages}")
@@ -518,20 +502,17 @@ def sms_auto_reply():
         return "Format JSON invalide", 400
 
     if not isinstance(messages, list):
-        log(f"[{request_id}] ❌ Format JSON non liste")
         return "Liste attendue", 400
 
-    # ✅ Mise en file Celery (60 à 180 sec)
     for i, msg in enumerate(messages):
         try:
             delay = random.randint(60, 180)
             log(f"[{request_id}] ⏱️ Mise en file message {i} avec délai {delay}s")
             result = process_message.apply_async(args=[json.dumps(msg)], countdown=delay)
-            log(f"[{request_id}] ✅ Job {i} Celery ID : {result.id}")
+            log(f"[{request_id}] ✅ Celery ID : {result.id}")
         except Exception as e:
-            log(f"[{request_id}] ❌ Erreur Celery file {i} : {e}")
+            log(f"[{request_id}] ❌ Erreur Celery : {e}")
 
-    log(f"[{request_id}] 🏁 Tous les messages sont en file")
     return "OK", 200
 
 
