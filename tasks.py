@@ -12,6 +12,40 @@ SECOND_MESSAGE_LINK = os.getenv("SECOND_MESSAGE_LINK")
 REDIS_URL = os.getenv("REDIS_URL")
 redis_conn = Redis.from_url(REDIS_URL)
 
+CONFIG_KEY = "config:autoreply"
+
+def _config_defaults():
+    return {
+        "enabled": True,
+        "reply_mode": 2,
+        "min_in_before_reply": 1,
+        "step0_type": "mms",
+        "step1_type": "mms",
+        "step0_text": "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?",
+        "step1_text": "Ok alors choisissez ici votre nouveau créneau ou point relais : {link}\nSans ça je peux rien faire, merci et bonne journée.",
+    }
+
+def load_config():
+    raw = redis_conn.get(CONFIG_KEY)
+    defaults = _config_defaults()
+    if not raw:
+        return defaults
+    try:
+        cfg = json.loads(raw.decode("utf-8"))
+        if not isinstance(cfg, dict):
+            return defaults
+        defaults.update(cfg)
+        # normalisation minimale
+        defaults["reply_mode"] = 1 if int(defaults.get("reply_mode", 2)) == 1 else 2
+        defaults["min_in_before_reply"] = max(1, int(defaults.get("min_in_before_reply", 1)))
+        if defaults.get("step0_type") not in ("sms", "mms"):
+            defaults["step0_type"] = "mms"
+        if defaults.get("step1_type") not in ("sms", "mms"):
+            defaults["step1_type"] = "mms"
+        return defaults
+    except Exception:
+        return defaults
+
 def get_conversation_key(number):
     return f"conv:{number}"
 
@@ -39,21 +73,26 @@ def send_request(url, post_data):
         log(f"❌ Erreur POST : {e}")
         return None
 
-def send_single_message(number, message, device_slot):
-    log(f"📦 Envoi à {number} via SIM {device_slot}")
+def send_single_message(number, message, device_slot, msg_type):
+    log(f"📦 Envoi à {number} via device {device_slot} (type={msg_type})")
     return send_request(f"{SERVER}/services/send.php", {
-        'number': number,
-        'message': message,
-        'devices': device_slot,
-        'type': 'mms',
-        'prioritize': 1,
-        'key': API_KEY,
+        "number": number,
+        "message": message,
+        "devices": device_slot,
+        "type": msg_type,     # sms|mms
+        "prioritize": 1,
+        "key": API_KEY,
     })
 
 @celery.task(name="process_message")
 def process_message(msg_json):
     log("🔧 Début de process_message")
     log(f"🛎️ Job brut reçu : {msg_json}")
+
+    cfg = load_config()
+    if not cfg.get("enabled", True):
+        log("⏸️ Auto-reply désactivé (config:autoreply.enabled=false).")
+        return
 
     try:
         msg = json.loads(msg_json)
@@ -81,18 +120,46 @@ def process_message(msg_json):
             return
 
         conv_key = get_conversation_key(number)
+
+        # ✅ Compteur entrants (pour la règle min_in_before_reply)
+        in_count = redis_conn.hincrby(conv_key, "in_count", 1)
+        min_in = int(cfg.get("min_in_before_reply", 1))
+        log(f"📥 [{msg_id_short}] in_count={in_count} (min_in_before_reply={min_in})")
+
+        # Si on doit attendre plus de messages avant de répondre
+        if in_count < min_in:
+            mark_message_processed(number, msg_id)
+            log(f"⏳ [{msg_id_short}] Pas de réponse (seuil non atteint).")
+            return
+
         step = int(redis_conn.hget(conv_key, "step") or 0)
         redis_conn.hset(conv_key, "device", device_id)
 
         log(f"📊 [{msg_id_short}] Étape actuelle : {step}")
 
+        reply_mode = int(cfg.get("reply_mode", 2))
+        step0_text = cfg.get("step0_text") or ""
+        step1_text = cfg.get("step1_text") or ""
+        link = SECOND_MESSAGE_LINK or ""
+        step0_type = cfg.get("step0_type", "mms")
+        step1_type = cfg.get("step1_type", "mms")
+
         if step == 0:
-            reply = "Pardon c’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?"
+            reply = step0_text
             redis_conn.hset(conv_key, "step", 1)
+            msg_type = step0_type
             log(f"📤 [{msg_id_short}] Réponse étape 0 envoyée.")
         elif step == 1:
-            reply = f"Ok alors choisissez ici votre nouveau créneau ou point relais : {SECOND_MESSAGE_LINK}\nSans ça je peux rien faire, merci et bonne journée."
+            if reply_mode == 1:
+                archive_number(number)
+                redis_conn.delete(conv_key)
+                mark_message_processed(number, msg_id)
+                log(f"✅ [{msg_id_short}] Mode 1 réponse: conversation archivée (pas de step1).")
+                return
+
+            reply = step1_text.replace("{link}", link)
             redis_conn.hset(conv_key, "step", 2)
+            msg_type = step1_type
             log(f"📤 [{msg_id_short}] Réponse étape 1 envoyée.")
         else:
             archive_number(number)
@@ -100,7 +167,7 @@ def process_message(msg_json):
             log(f"✅ [{msg_id_short}] Conversation terminée et archivée.")
             return
 
-        send_single_message(number, reply, device_id)
+        send_single_message(number, reply, device_id, msg_type)
         mark_message_processed(number, msg_id)
         log(f"✅ [{msg_id_short}] Réponse envoyée : {reply}")
         log(f"🏁 [{msg_id_short}] Fin du traitement de ce message")
