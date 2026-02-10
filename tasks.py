@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from redis import Redis
 from logger import log
 from celery_worker import celery  # 🔁 Import du Celery app
@@ -15,7 +16,7 @@ CONFIG_KEY = "config:autoreply"
 
 
 def _config_defaults():
-    # ✅ Defaults vides : tout est réglé depuis l’interface /admin/settings
+    # ✅ Defaults vides : tout est réglé depuis /admin/settings
     return {
         "enabled": True,
         "reply_mode": 2,
@@ -40,7 +41,7 @@ def load_config():
 
         defaults.update(cfg)
 
-        # normalisation minimale
+        defaults["enabled"] = bool(defaults.get("enabled", True))
         defaults["reply_mode"] = 1 if int(defaults.get("reply_mode", 2)) == 1 else 2
         defaults["min_in_before_reply"] = max(1, int(defaults.get("min_in_before_reply", 1)))
 
@@ -49,12 +50,8 @@ def load_config():
         if defaults.get("step1_type") not in ("sms", "mms"):
             defaults["step1_type"] = "sms"
 
-        # sécurité: toujours string
         defaults["step0_text"] = str(defaults.get("step0_text") or "")
         defaults["step1_text"] = str(defaults.get("step1_text") or "")
-
-        # enabled bool
-        defaults["enabled"] = bool(defaults.get("enabled", True))
 
         return defaults
     except Exception:
@@ -79,6 +76,22 @@ def mark_message_processed(number, msg_id):
 
 def is_message_processed(number, msg_id):
     return redis_conn.sismember(f"processed:{number}", msg_id)
+
+
+def _stat_incr(device_id: str, key: str, amount: int = 1):
+    redis_conn.incrby(f"stats:device:{device_id}:{key}", amount)
+
+
+def _stat_last_seen(device_id: str):
+    redis_conn.set(f"stats:device:{device_id}:last_seen", int(time.time()))
+
+
+def _cycle_incr_received(device_id: str, amount: int = 1):
+    redis_conn.incrby(f"cycle:device:{device_id}:received", amount)
+
+
+def _cycle_incr_sent(device_id: str, amount: int = 1):
+    redis_conn.incrby(f"cycle:device:{device_id}:sent", amount)
 
 
 def send_request(url, post_data):
@@ -138,6 +151,15 @@ def process_message(msg_json):
         log(f"⛔️ [{msg_id_short}] Champs manquants : number={number}, ID={msg_id}, device={device_id}")
         return
 
+    # ✅ enregistre le device comme “vu”
+    try:
+        redis_conn.sadd("devices:seen", str(device_id))
+        _stat_last_seen(str(device_id))
+        _stat_incr(str(device_id), "received", 1)
+        _cycle_incr_received(str(device_id), 1)
+    except Exception:
+        pass
+
     try:
         if is_archived(number):
             log(f"🗃️ [{msg_id_short}] Numéro archivé, ignoré.")
@@ -149,12 +171,11 @@ def process_message(msg_json):
 
         conv_key = get_conversation_key(number)
 
-        # ✅ Compteur entrants (pour la règle min_in_before_reply)
+        # ✅ Compteur entrants par NUMERO (conversation)
         in_count = redis_conn.hincrby(conv_key, "in_count", 1)
         min_in = int(cfg.get("min_in_before_reply", 1))
         log(f"📥 [{msg_id_short}] in_count={in_count} (min_in_before_reply={min_in})")
 
-        # Si on doit attendre plus de messages avant de répondre
         if in_count < min_in:
             mark_message_processed(number, msg_id)
             log(f"⏳ [{msg_id_short}] Pas de réponse (seuil non atteint).")
@@ -195,9 +216,22 @@ def process_message(msg_json):
             return
 
         send_single_message(number, reply, device_id, msg_type)
+
+        # ✅ stats envoi (si message non vide)
+        if (reply or "").strip():
+            try:
+                _stat_incr(str(device_id), "sent", 1)
+                _cycle_incr_sent(str(device_id), 1)
+            except Exception:
+                pass
+
         mark_message_processed(number, msg_id)
         log(f"✅ [{msg_id_short}] Traitement terminé (envoi tenté si message non vide).")
         log(f"🏁 [{msg_id_short}] Fin du traitement")
 
     except Exception as e:
         log(f"💥 [{msg_id_short}] Erreur interne : {e}")
+        try:
+            _stat_incr(str(device_id), "errors", 1)
+        except Exception:
+            pass
