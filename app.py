@@ -18,6 +18,9 @@ from tasks import process_message
 from openpyxl import load_workbook
 
 
+# -----------------------
+# ENV / REDIS
+# -----------------------
 API_KEY = os.getenv("API_KEY")
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 LOG_FILE = "/tmp/log.txt"
@@ -31,16 +34,25 @@ redis_conn = Redis.from_url(REDIS_URL)
 
 CONFIG_KEY = "config:autoreply"
 
-NL_META_KEY = "nl:meta"
-NL_SAMPLE_KEY = "nl:sample"
-NL_MESSAGE_KEY = "nl:message"   # message draft (UI only)
-NL_TYPE_KEY = "nl:type"         # sms|mms (UI only)
+# Numlist keys
+NL_META_KEY = "nl:meta"              # json meta
+NL_POOL_LIST = "nl:pool"             # Redis LIST of JSON records (remaining)
+NL_ARCHIVE_LIST = "nl:archive"       # optional: consumed history
+NL_MESSAGE_KEY = "nl:message"        # message template (UI)
+NL_TYPE_KEY = "nl:type"              # sms|mms (UI)
+
+BATCH_INDEX = "nl:batch:index"       # incr counter
+BATCH_META_PREFIX = "nl:batch:meta:" # +id -> json
+BATCH_ITEMS_PREFIX = "nl:batch:items:"  # +id -> LIST of JSON records
 
 
 app = Flask(__name__)
 app.secret_key = APP_SECRET_KEY or os.urandom(32)
 
 
+# -----------------------
+# AUTH
+# -----------------------
 def _is_logged_in():
     return session.get("admin_logged_in") is True
 
@@ -51,9 +63,12 @@ def _require_login():
     return None
 
 
+# -----------------------
+# CONFIG (autoreply)
+# -----------------------
 def _get_config_defaults():
     return {
-        "reply_mode": 2,        # 1 ou 2
+        "reply_mode": 2,
         "step0_type": "sms",
         "step1_type": "sms",
         "step0_text": "",
@@ -66,24 +81,18 @@ def load_config():
     defaults = _get_config_defaults()
     if not raw:
         return defaults
-
     try:
         cfg = json.loads(raw.decode("utf-8"))
         if not isinstance(cfg, dict):
             return defaults
-
         defaults.update(cfg)
-
         defaults["reply_mode"] = 1 if int(defaults.get("reply_mode", 2)) == 1 else 2
-
         if defaults.get("step0_type") not in ("sms", "mms"):
             defaults["step0_type"] = "sms"
         if defaults.get("step1_type") not in ("sms", "mms"):
             defaults["step1_type"] = "sms"
-
         defaults["step0_text"] = str(defaults.get("step0_text") or "")
         defaults["step1_text"] = str(defaults.get("step1_text") or "")
-
         return defaults
     except Exception:
         return defaults
@@ -93,6 +102,9 @@ def save_config(cfg: dict):
     redis_conn.set(CONFIG_KEY, json.dumps(cfg, ensure_ascii=False))
 
 
+# -----------------------
+# GATEWAY DEVICES
+# -----------------------
 def _redis_int(key: str) -> int:
     try:
         return int(redis_conn.get(key) or 0)
@@ -117,7 +129,6 @@ def fetch_gateway_devices():
     import requests
     if not SERVER or not API_KEY:
         return []
-
     url = f"{SERVER}/services/get-devices.php"
     try:
         r = requests.get(url, params={"key": API_KEY}, timeout=12)
@@ -131,31 +142,24 @@ def fetch_gateway_devices():
         return []
 
 
+# -----------------------
+# NUM LIST PARSING
+# -----------------------
 def _norm_col(name: str) -> str:
     return (name or "").strip().lower()
 
 
 def _pick_number_column(columns):
-    """
-    Essaie de deviner la colonne numéro.
-    Si rien n’est sûr => première colonne.
-    """
     if not columns:
         return None
-
-    candidates = {
-        "number", "num", "phone", "telephone", "tel", "mobile", "msisdn", "numero", "numéro"
-    }
+    candidates = {"number", "num", "phone", "telephone", "tel", "mobile", "msisdn", "numero", "numéro"}
     for c in columns:
         if _norm_col(c) in candidates:
             return c
-
-    # fallback : première colonne
     return columns[0]
 
 
 def _read_csv(file_bytes: bytes):
-    # on essaye utf-8, sinon latin-1
     text = None
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
@@ -166,7 +170,6 @@ def _read_csv(file_bytes: bytes):
     if text is None:
         raise Exception("Encodage CSV non supporté")
 
-    # Sniff delimiter
     sample = text[:4096]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=";,|\t,")
@@ -176,22 +179,17 @@ def _read_csv(file_bytes: bytes):
 
     reader = csv.reader(io.StringIO(text), delimiter=delimiter)
     rows = list(reader)
-
-    # vide ?
     if not rows:
         return [], []
 
-    # header ?
     header = rows[0]
     data_rows = rows[1:] if any(h.strip() for h in header) else rows
 
-    # si pas de header propre, on génère col1 col2...
     if not any(h.strip() for h in header):
         max_len = max(len(r) for r in rows)
         header = [f"col{i+1}" for i in range(max_len)]
         data_rows = rows
 
-    # normalise longueur des lignes
     cleaned = []
     for r in data_rows:
         rr = list(r) + [""] * (len(header) - len(r))
@@ -203,7 +201,6 @@ def _read_csv(file_bytes: bytes):
 def _read_xlsx(file_bytes: bytes):
     wb = load_workbook(filename=io.BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb.active
-
     rows = []
     for row in ws.iter_rows(values_only=True):
         rows.append([("" if v is None else str(v)) for v in row])
@@ -214,13 +211,11 @@ def _read_xlsx(file_bytes: bytes):
     header = rows[0]
     data_rows = rows[1:]
 
-    # si header vide, on fabrique
     if not any(str(h).strip() for h in header):
         max_len = max(len(r) for r in rows)
         header = [f"col{i+1}" for i in range(max_len)]
         data_rows = rows
 
-    # trim header
     header = [str(h).strip() if str(h).strip() else f"col{i+1}" for i, h in enumerate(header)]
 
     cleaned = []
@@ -229,6 +224,20 @@ def _read_xlsx(file_bytes: bytes):
         cleaned.append(rr[:len(header)])
 
     return header, cleaned
+
+
+def _dedupe_header(header):
+    seen = {}
+    final_header = []
+    for h in header:
+        base = (h or "").strip() or "col"
+        if base in seen:
+            seen[base] += 1
+            base = f"{base}_{seen[base]}"
+        else:
+            seen[base] = 1
+        final_header.append(base)
+    return final_header
 
 
 def _build_records(header, rows, number_col):
@@ -240,7 +249,6 @@ def _build_records(header, rows, number_col):
         number = str(r[idx]).strip()
         if not number:
             continue
-
         rec = {}
         for i, col in enumerate(header):
             rec[col] = str(r[i]).strip() if i < len(r) else ""
@@ -248,21 +256,11 @@ def _build_records(header, rows, number_col):
     return records
 
 
-def _save_nl_meta(header, number_col, records):
-    variables = [c for c in header if c != number_col]
-    meta = {
-        "count": len(records),
-        "columns": header,
-        "number_col": number_col,
-        "variables": variables,
-        "updated_at": int(time.time()),
-    }
-    redis_conn.set(NL_META_KEY, json.dumps(meta, ensure_ascii=False))
-
-    sample = records[:10]
-    redis_conn.set(NL_SAMPLE_KEY, json.dumps(sample, ensure_ascii=False))
-
-    return meta, sample
+def _nl_remaining_count():
+    try:
+        return int(redis_conn.llen(NL_POOL_LIST) or 0)
+    except Exception:
+        return 0
 
 
 def _load_nl_meta():
@@ -275,14 +273,8 @@ def _load_nl_meta():
         return None
 
 
-def _load_nl_sample():
-    raw = redis_conn.get(NL_SAMPLE_KEY)
-    if not raw:
-        return []
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
-        return []
+def _save_nl_meta(meta: dict):
+    redis_conn.set(NL_META_KEY, json.dumps(meta, ensure_ascii=False))
 
 
 def _load_message_draft():
@@ -298,8 +290,115 @@ def _save_message_draft(message: str, msg_type: str):
     redis_conn.set(NL_TYPE_KEY, msg_type if msg_type in ("sms", "mms") else "sms")
 
 
+def _template_vars_from_meta(nl_meta):
+    if not nl_meta:
+        return []
+    return list(nl_meta.get("variables") or [])
+
+
 # -----------------------
-# ADMIN
+# BATCH RESERVATION (consume from pool)
+# -----------------------
+def _reserve_from_pool(count: int):
+    """
+    Prend 'count' éléments du pool (remaining) et les retourne (liste de dict).
+    ✅ Consommation réelle : on retire du pool.
+    """
+    if count <= 0:
+        return []
+
+    items = []
+    pipe = redis_conn.pipeline()
+    for _ in range(count):
+        pipe.lpop(NL_POOL_LIST)
+    raw_items = pipe.execute()
+
+    for raw in raw_items:
+        if not raw:
+            continue
+        try:
+            items.append(json.loads(raw.decode("utf-8")))
+        except Exception:
+            continue
+    return items
+
+
+def _create_batch(selected_device_ids, per_device: int):
+    selected_device_ids = [str(x) for x in (selected_device_ids or []) if str(x).strip()]
+    per_device = int(per_device or 0)
+    if per_device < 0:
+        per_device = 0
+
+    nb_devices = len(selected_device_ids)
+    total = per_device * nb_devices
+    if total <= 0:
+        return None, "Total à 0"
+
+    remaining = _nl_remaining_count()
+    if remaining <= 0:
+        return None, "Numlist vide"
+
+    # si pas assez, on prend ce qu’on peut
+    to_take = min(total, remaining)
+
+    batch_id = str(redis_conn.incr(BATCH_INDEX))
+    reserved = _reserve_from_pool(to_take)
+
+    # archive (optionnel) -> garder trace de ce qui a été consommé
+    if reserved:
+        pipe = redis_conn.pipeline()
+        for rec in reserved:
+            pipe.rpush(NL_ARCHIVE_LIST, json.dumps(rec, ensure_ascii=False))
+        pipe.execute()
+
+    # stock batch items
+    pipe = redis_conn.pipeline()
+    for rec in reserved:
+        pipe.rpush(BATCH_ITEMS_PREFIX + batch_id, json.dumps(rec, ensure_ascii=False))
+    pipe.execute()
+
+    meta = {
+        "batch_id": batch_id,
+        "created_at": int(time.time()),
+        "devices": selected_device_ids,
+        "per_device": per_device,
+        "requested_total": total,
+        "taken_total": len(reserved),
+        "remaining_after": _nl_remaining_count(),
+    }
+    redis_conn.set(BATCH_META_PREFIX + batch_id, json.dumps(meta, ensure_ascii=False))
+
+    return meta, None
+
+
+def _list_last_batches(limit=10):
+    # on prend les derniers batch_ids via incr index
+    idx = _redis_int(BATCH_INDEX)
+    out = []
+    for i in range(idx, max(0, idx - limit), -1):
+        raw = redis_conn.get(BATCH_META_PREFIX + str(i))
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw.decode("utf-8")))
+        except Exception:
+            continue
+    return out
+
+
+def _load_batch_items(batch_id: str, limit=50):
+    raw_items = redis_conn.lrange(BATCH_ITEMS_PREFIX + str(batch_id), 0, max(0, limit - 1))
+    items = []
+    for raw in raw_items:
+        try:
+            items.append(json.loads(raw.decode("utf-8")))
+        except Exception:
+            continue
+    return items
+
+
+# -----------------------
+# ROUTES: LOGIN
 # -----------------------
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
@@ -363,6 +462,134 @@ def admin_home():
     return redirect(url_for("admin_settings"))
 
 
+# -----------------------
+# ROUTES: NUM LIST
+# -----------------------
+@app.route("/admin/nl/clear", methods=["GET"])
+def admin_nl_clear():
+    guard = _require_login()
+    if guard:
+        return guard
+
+    # clear pool + meta + message draft
+    redis_conn.delete(NL_META_KEY)
+    redis_conn.delete(NL_POOL_LIST)
+    # on ne touche pas l'archive ni les batchs
+    return redirect(url_for("admin_settings"))
+
+
+@app.route("/admin/nl/upload", methods=["POST"])
+def admin_nl_upload():
+    guard = _require_login()
+    if guard:
+        return guard
+
+    files = request.files.getlist("files")
+    if not files:
+        return Response("Fichier manquant", status=400)
+
+    all_records = []
+    all_columns = None
+    number_col_global = None
+
+    try:
+        for f in files:
+            filename = (f.filename or "").lower().strip()
+            file_bytes = f.read()
+            if not file_bytes:
+                continue
+
+            if filename.endswith(".csv"):
+                header, rows = _read_csv(file_bytes)
+            elif filename.endswith(".xlsx"):
+                header, rows = _read_xlsx(file_bytes)
+            else:
+                continue
+
+            header = _dedupe_header(header)
+            number_col = _pick_number_column(header)
+            if not number_col:
+                continue
+
+            records = _build_records(header, rows, number_col)
+
+            if all_columns is None:
+                all_columns = header
+                number_col_global = number_col
+            else:
+                for c in header:
+                    if c not in all_columns:
+                        all_columns.append(c)
+
+            # normalise records sur all_columns
+            for rec in records:
+                for c in all_columns:
+                    rec.setdefault(c, "")
+                all_records.append(rec)
+
+        if not all_records or not all_columns:
+            return Response("Aucun numéro importé", status=400)
+
+        if number_col_global not in all_columns:
+            number_col_global = _pick_number_column(all_columns)
+
+        # push into pool (remaining) WITHOUT clearing existing (tu peux importer plusieurs fois)
+        pipe = redis_conn.pipeline()
+        for rec in all_records:
+            pipe.rpush(NL_POOL_LIST, json.dumps(rec, ensure_ascii=False))
+        pipe.execute()
+
+        variables = [c for c in all_columns if c != number_col_global]
+        meta = {
+            "columns": all_columns,
+            "number_col": number_col_global,
+            "variables": variables,
+            "updated_at": int(time.time()),
+        }
+        _save_nl_meta(meta)
+
+        return redirect(url_for("admin_settings"))
+
+    except Exception as e:
+        log(f"❌ NL upload error: {e}")
+        return Response(f"Erreur import: {e}", status=400)
+
+
+@app.route("/admin/nl/message", methods=["POST"])
+def admin_nl_message():
+    guard = _require_login()
+    if guard:
+        return guard
+
+    message = (request.form.get("nl_message") or "").strip()
+    msg_type = (request.form.get("nl_type") or "sms").strip().lower()
+    _save_message_draft(message, msg_type)
+    return redirect(url_for("admin_settings"))
+
+
+@app.route("/admin/nl/send", methods=["POST"])
+def admin_nl_send():
+    """
+    'Envoyer' dans l'UI = on prépare un lot consommé du pool et on affiche le payload prêt.
+    (Le site NE déclenche pas l'envoi outbound automatiquement.)
+    """
+    guard = _require_login()
+    if guard:
+        return guard
+
+    per_device = int(request.form.get("per_device") or 0)
+    device_ids = request.form.getlist("device_ids")
+
+    meta, err = _create_batch(device_ids, per_device)
+    if err:
+        return Response(err, status=400, mimetype="text/plain")
+
+    return redirect(url_for("admin_settings", batch=meta["batch_id"]))
+
+
+# -----------------------
+# ROUTES: SETTINGS / UI
+# -----------------------
 @app.route("/admin/settings", methods=["GET", "POST"])
 def admin_settings():
     guard = _require_login()
@@ -371,20 +598,10 @@ def admin_settings():
 
     cfg = load_config()
 
-    # Save message draft (UI only)
-    if request.method == "POST" and request.form.get("form_name") == "message_draft":
-        message = (request.form.get("nl_message") or "").strip()
-        msg_type = (request.form.get("nl_type") or "sms").strip().lower()
-        _save_message_draft(message, msg_type)
-        return redirect(url_for("admin_settings"))
-
-    # Save autoreply config
     if request.method == "POST" and request.form.get("form_name") == "autoreply":
         reply_mode = int(request.form.get("reply_mode") or 2)
-
         step0_type = (request.form.get("step0_type") or "sms").strip().lower()
         step1_type = (request.form.get("step1_type") or "sms").strip().lower()
-
         step0_text = (request.form.get("step0_text") or "").strip()
         step1_text = (request.form.get("step1_text") or "").strip()
 
@@ -394,7 +611,6 @@ def admin_settings():
             step0_type = "sms"
         if step1_type not in ("sms", "mms"):
             step1_type = "sms"
-
         if reply_mode == 1:
             step1_text = ""
 
@@ -408,22 +624,35 @@ def admin_settings():
         save_config(cfg)
         return redirect(url_for("admin_settings"))
 
-    # Read NL meta/sample and message draft
     nl_meta = _load_nl_meta()
-    nl_sample = _load_nl_sample()
+    remaining = _nl_remaining_count()
     nl_message, nl_type = _load_message_draft()
 
-    # Devices
+    # devices from gateway
     gw_devices = fetch_gateway_devices()
     rows = []
     for d in gw_devices:
         did = str(d.get("id"))
         s = _device_stats(did)
-        s.update({
-            "name": d.get("name") or "",
-            "model": d.get("model") or "",
-        })
+        s.update({"name": d.get("name") or "", "model": d.get("model") or ""})
         rows.append(s)
+
+    vars_list = _template_vars_from_meta(nl_meta)
+
+    # last batches + optional selected batch
+    batches = _list_last_batches(limit=8)
+    selected_batch = request.args.get("batch")
+    selected_meta = None
+    selected_items = []
+    if selected_batch:
+        raw = redis_conn.get(BATCH_META_PREFIX + str(selected_batch))
+        if raw:
+            try:
+                selected_meta = json.loads(raw.decode("utf-8"))
+            except Exception:
+                selected_meta = None
+        if selected_meta:
+            selected_items = _load_batch_items(selected_batch, limit=25)
 
     return render_template_string("""
 <!doctype html>
@@ -435,20 +664,19 @@ def admin_settings():
   <style>
     :root{
       --bg:#070a12; --card:#121a2a; --line:#22304a; --txt:#e8eefc; --muted:#8aa0c7;
-      --btn:#2d6cdf; --btn2:#0e1626; --good:#24d18f;
+      --btn:#2d6cdf; --good:#24d18f;
     }
     body{margin:0;background:linear-gradient(180deg,#070a12 0%, #0b0f1a 100%);color:var(--txt);font-family:Arial;}
     .wrap{max-width:1200px;margin:0 auto;padding:18px;}
     .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;}
     .top h2{margin:0;font-size:18px;}
     a{color:#9bc1ff;text-decoration:none;font-weight:700}
-    .grid{display:grid;grid-template-columns:1fr;gap:12px;}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-top:12px;}
     .muted{color:var(--muted);font-size:12px}
     .title{font-weight:900;margin-bottom:10px}
     .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
     label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
-    textarea, select, input[type="file"]{
+    textarea, select, input[type="file"], input[type="number"]{
       width:100%;box-sizing:border-box;background:#0e1626;border:1px solid var(--line);
       color:var(--txt);padding:12px;border-radius:12px;outline:none;
     }
@@ -460,14 +688,20 @@ def admin_settings():
       background-size: 6px 6px, 6px 6px;
       background-repeat:no-repeat;
     }
-    .btn{background:var(--btn);border:0;color:white;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900}
-    .btn2{background:var(--btn2);border:1px solid var(--line);color:#cfe0ff;padding:9px 12px;border-radius:12px;cursor:pointer;font-weight:900}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+    .btn{
+      height:42px; display:inline-flex; align-items:center; justify-content:center;
+      padding:0 16px; border-radius:12px; cursor:pointer; font-weight:900;
+      border:1px solid var(--line); text-decoration:none;
+    }
+    .btn-primary{background:var(--btn); color:white; border:0}
+    .btn-secondary{background:#0e1626; color:#cfe0ff}
+    .btn-danger{background:#2a1220; color:#ffb6c6; border:1px solid #4a22304a}
     .pill{display:inline-flex;gap:8px;align-items:center;background:#0e1626;border:1px solid var(--line);padding:10px 12px;border-radius:14px}
     .dot{width:9px;height:9px;border-radius:99px;background:var(--good)}
     table{width:100%;border-collapse:collapse}
     th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
     th{color:var(--muted);font-weight:900}
-    .hide{display:none}
     code{background:#0e1626;padding:2px 6px;border-radius:10px;border:1px solid var(--line)}
     .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
     .chip{
@@ -475,7 +709,7 @@ def admin_settings():
       padding:8px 10px; border-radius:999px; cursor:pointer; font-weight:900; font-size:12px;
     }
     .chip:hover{filter:brightness(1.15)}
-    .grid2{display:grid;grid-template-columns:1fr;gap:10px}
+    .grid2{display:grid;grid-template-columns:1fr;gap:12px}
     @media(min-width:900px){ .grid2{grid-template-columns:1fr 1fr} }
   </style>
 </head>
@@ -525,50 +759,56 @@ def admin_settings():
       </table>
     </div>
 
-    <!-- NUM LIST IMPORT + MESSAGE -->
-    <div class="card" style="margin-top:12px">
-      <div class="title">Numlist (Excel/CSV) + Variables + Message</div>
+    <!-- NUMLIST + MESSAGE -->
+    <div class="card">
+      <div class="title">Numlist + Message</div>
 
-      <div class="grid2">
+      <div class="row">
+        <div class="pill" style="min-width:260px">
+          <div>
+            <div class="muted">Numéros restants</div>
+            <div style="font-size:26px;font-weight:900">{{ remaining }}</div>
+          </div>
+        </div>
 
+        {% if nl_meta %}
+          <div class="pill" style="min-width:260px">
+            <div>
+              <div class="muted">Colonne numéro</div>
+              <div style="font-weight:900"><code>{{ nl_meta.number_col }}</code></div>
+            </div>
+          </div>
+        {% endif %}
+      </div>
+
+      <div class="grid2" style="margin-top:12px">
         <div>
           <form method="post" action="/admin/nl/upload" enctype="multipart/form-data">
-            <label>Importer un fichier (.xlsx ou .csv)</label>
-            <input type="file" name="file" accept=".xlsx,.csv" required>
-            <div class="row" style="margin-top:10px">
-              <button class="btn2" type="submit">Importer</button>
-              <a class="btn2" href="/admin/nl/clear" style="display:inline-block;text-align:center;line-height:18px">Vider</a>
+            <label>Importer des fichiers (.xlsx ou .csv)</label>
+            <input type="file" name="files" accept=".xlsx,.csv" multiple required>
+            <div class="actions">
+              <button class="btn btn-secondary" type="submit">Importer</button>
+              <a class="btn btn-danger" href="/admin/nl/clear">Vider</a>
             </div>
           </form>
 
-          {% if nl_meta %}
-            <div class="muted" style="margin-top:12px">
-              <div><b>{{ nl_meta.count }}</b> numéros importés</div>
-              <div>Colonne numéro : <code>{{ nl_meta.number_col }}</code></div>
-              <div style="margin-top:6px">Variables détectées :</div>
-              <div class="chips">
-                {% for v in nl_meta.variables %}
-                  <div class="chip" onclick="insertVar('{{ v }}')">{% raw %}{{{% endraw %}{{ v }}{% raw %}}}{% endraw %}</div>
-                {% endfor %}
-                {% if nl_meta.variables|length == 0 %}
-                  <div class="muted">Aucune variable (seulement la colonne numéro)</div>
-                {% endif %}
-              </div>
+          {% if vars_list|length > 0 %}
+            <div class="muted" style="margin-top:12px">Variables détectées :</div>
+            <div class="chips">
+              {% for v in vars_list %}
+                <div class="chip" onclick="insertVar('{{ v }}')">{{'{{'}}{{ v }}{{'}}'}}</div>
+              {% endfor %}
             </div>
           {% else %}
-            <div class="muted" style="margin-top:12px">
-              Importe un fichier avec au minimum une colonne numéro.
-              Si le fichier a plusieurs colonnes (ex: ville, nom), elles deviennent des variables.
-            </div>
+            <div class="muted" style="margin-top:12px">Aucune variable (fichier 1 colonne ou seulement numéro)</div>
           {% endif %}
         </div>
 
         <div>
-          <form method="post">
-            <input type="hidden" name="form_name" value="message_draft">
+          <form method="post" action="/admin/nl/message">
             <div class="row">
               <div style="min-width:220px;flex:1;max-width:320px">
-                <label>Type de message (draft)</label>
+                <label>Type</label>
                 <select name="nl_type">
                   <option value="sms" {% if nl_type == 'sms' %}selected{% endif %}>sms</option>
                   <option value="mms" {% if nl_type == 'mms' %}selected{% endif %}>mms</option>
@@ -577,49 +817,115 @@ def admin_settings():
             </div>
 
             <div style="margin-top:10px">
-              <label>Ton message (tu peux cliquer sur les variables à gauche)</label>
+              <label>Message</label>
               <textarea id="nl_message" name="nl_message">{{ nl_message }}</textarea>
             </div>
 
-            <div style="margin-top:10px">
-              <button class="btn" type="submit">Sauvegarder le message</button>
+            <div class="actions">
+              <button class="btn btn-primary" type="submit">Enregistrer message</button>
             </div>
-
-            {% if nl_sample and nl_meta %}
-              <div class="muted" style="margin-top:12px">
-                Preview variables (10 premières lignes) :
-              </div>
-              <div style="margin-top:6px;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:12px">
-                <table>
-                  <thead>
-                    <tr>
-                      {% for c in nl_meta.columns %}
-                        <th>{{ c }}</th>
-                      {% endfor %}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {% for rec in nl_sample %}
-                      <tr>
-                        {% for c in nl_meta.columns %}
-                          <td>{{ rec.get(c, "") }}</td>
-                        {% endfor %}
-                      </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-              </div>
-            {% endif %}
           </form>
         </div>
-
       </div>
+
+      <form method="post" action="/admin/nl/send" style="margin-top:14px">
+        <div class="row">
+          <div style="min-width:260px;max-width:320px;flex:1">
+            <label>Nombre par appareil</label>
+            <input type="number" min="0" name="per_device" value="0">
+          </div>
+        </div>
+
+        <div class="muted" style="margin-top:10px">Appareils sélectionnés :</div>
+        <div class="chips" style="margin-top:8px">
+          {% for r in rows %}
+            <label class="chip" style="display:inline-flex;align-items:center;gap:8px">
+              <input type="checkbox" name="device_ids" value="{{ r.device_id }}" style="accent-color:#2d6cdf">
+              #{{ r.device_id }}
+            </label>
+          {% endfor %}
+        </div>
+
+        <div class="actions" style="margin-top:12px">
+          <button class="btn btn-primary" type="submit">Envoyer (prépare le lot)</button>
+        </div>
+
+        <div class="muted" style="margin-top:8px">
+          Ce bouton prépare un lot (consomme des numéros) et affiche un payload prêt à envoyer via ton gateway.
+        </div>
+      </form>
     </div>
 
-    <!-- AUTOREPLY (on garde, mais tu peux ignorer pour l’instant) -->
-    <div class="card" style="margin-top:12px">
-      <div class="title">Auto-reply (réponses)</div>
-      <form method="post" class="grid">
+    <!-- BATCH RESULT -->
+    {% if selected_meta %}
+      <div class="card">
+        <div class="title">Lot #{{ selected_meta.batch_id }}</div>
+        <div class="muted">
+          Pris: <b>{{ selected_meta.taken_total }}</b> / demandé: {{ selected_meta.requested_total }} •
+          Restants: <b>{{ selected_meta.remaining_after }}</b>
+        </div>
+
+        <div style="margin-top:10px" class="muted">Payload (extrait 25 lignes max) :</div>
+        <div style="margin-top:6px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:12px">
+          <table>
+            <thead>
+              <tr>
+                <th>number</th>
+                <th>data</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for rec in selected_items %}
+                <tr>
+                  <td>{{ rec.get(nl_meta.number_col, '') if nl_meta else '' }}</td>
+                  <td class="muted">{{ rec }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="muted" style="margin-top:10px">
+          Type: <code>{{ nl_type }}</code> • Message: enregistré (variables possible).
+        </div>
+      </div>
+    {% endif %}
+
+    <!-- LAST BATCHES -->
+    {% if batches|length > 0 %}
+      <div class="card">
+        <div class="title">Derniers lots</div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Pris</th>
+              <th>Demandé</th>
+              <th>Appareils</th>
+              <th>Restants après</th>
+              <th>Voir</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for b in batches %}
+              <tr>
+                <td>#{{ b.batch_id }}</td>
+                <td>{{ b.taken_total }}</td>
+                <td>{{ b.requested_total }}</td>
+                <td class="muted">{{ b.devices }}</td>
+                <td>{{ b.remaining_after }}</td>
+                <td><a href="/admin/settings?batch={{ b.batch_id }}">ouvrir</a></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+
+    <!-- AUTOREPLY (optionnel) -->
+    <div class="card">
+      <div class="title">Auto-reply</div>
+      <form method="post">
         <input type="hidden" name="form_name" value="autoreply">
 
         <div class="row">
@@ -666,9 +972,8 @@ def admin_settings():
           </div>
         </div>
 
-        <div style="margin-top:10px">
-          <button class="btn" type="submit">Sauvegarder réponses</button>
-          <div class="muted" style="margin-top:8px">Webhook : <code>/sms_auto_reply</code></div>
+        <div class="actions">
+          <button class="btn btn-primary" type="submit">Sauvegarder réponses</button>
         </div>
       </form>
     </div>
@@ -680,12 +985,10 @@ def admin_settings():
       const el = document.getElementById("nl_message");
       if(!el) return;
       const token = "{{" + name + "}}";
-
       const start = el.selectionStart || 0;
       const end = el.selectionEnd || 0;
       const before = el.value.substring(0, start);
       const after = el.value.substring(end);
-
       el.value = before + token + after;
       el.focus();
       const pos = start + token.length;
@@ -695,75 +998,26 @@ def admin_settings():
     function toggleStep2() {
       const mode = document.getElementById("reply_mode").value;
       const block = document.getElementById("step2_block");
-      if (mode === "1") block.classList.add("hide");
-      else block.classList.remove("hide");
+      if (mode === "1") block.style.display = "none";
+      else block.style.display = "block";
     }
     document.getElementById("reply_mode").addEventListener("change", toggleStep2);
     toggleStep2();
   </script>
 </body>
 </html>
-""", cfg=cfg, rows=rows, nl_meta=nl_meta, nl_sample=nl_sample, nl_message=nl_message, nl_type=nl_type)
-
-
-@app.route("/admin/nl/clear", methods=["GET"])
-def admin_nl_clear():
-    guard = _require_login()
-    if guard:
-        return guard
-    redis_conn.delete(NL_META_KEY)
-    redis_conn.delete(NL_SAMPLE_KEY)
-    return redirect(url_for("admin_settings"))
-
-
-@app.route("/admin/nl/upload", methods=["POST"])
-def admin_nl_upload():
-    guard = _require_login()
-    if guard:
-        return guard
-
-    f = request.files.get("file")
-    if not f:
-        return Response("Fichier manquant", status=400)
-
-    filename = (f.filename or "").lower().strip()
-    file_bytes = f.read()
-
-    try:
-        if filename.endswith(".csv"):
-            header, rows = _read_csv(file_bytes)
-        elif filename.endswith(".xlsx"):
-            header, rows = _read_xlsx(file_bytes)
-        else:
-            return Response("Format non supporté (xlsx/csv)", status=400)
-
-        # clean header unique
-        seen = {}
-        final_header = []
-        for h in header:
-            base = (h or "").strip() or "col"
-            if base in seen:
-                seen[base] += 1
-                base = f"{base}_{seen[base]}"
-            else:
-                seen[base] = 1
-            final_header.append(base)
-        header = final_header
-
-        number_col = _pick_number_column(header)
-        if not number_col:
-            return Response("Aucune colonne détectée", status=400)
-
-        records = _build_records(header, rows, number_col)
-
-        meta, sample = _save_nl_meta(header, number_col, records)
-
-        log(f"✅ NL import: count={meta['count']} number_col={meta['number_col']} vars={meta['variables']}")
-        return redirect(url_for("admin_settings"))
-
-    except Exception as e:
-        log(f"❌ NL upload error: {e}")
-        return Response(f"Erreur import: {e}", status=400)
+""",
+        cfg=cfg,
+        rows=rows,
+        nl_meta=nl_meta,
+        remaining=remaining,
+        nl_message=nl_message,
+        nl_type=nl_type,
+        vars_list=vars_list,
+        batches=batches,
+        selected_meta=selected_meta,
+        selected_items=selected_items,
+    )
 
 
 # -----------------------
@@ -792,8 +1046,6 @@ def sms_auto_reply():
         if signature != expected_hash:
             log(f"[{request_id}] ❌ Signature invalide")
             return "Signature invalide", 403
-
-        log(f"[{request_id}] ✅ Signature valide")
 
     try:
         messages = json.loads(messages_raw)
