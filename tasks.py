@@ -6,7 +6,6 @@ from celery_worker import celery  # 🔁 Import du Celery app
 
 SERVER = os.getenv("SERVER")
 API_KEY = os.getenv("API_KEY")
-SECOND_MESSAGE_LINK = os.getenv("SECOND_MESSAGE_LINK")
 
 # ✅ Connexion Redis
 REDIS_URL = os.getenv("REDIS_URL")
@@ -14,52 +13,73 @@ redis_conn = Redis.from_url(REDIS_URL)
 
 CONFIG_KEY = "config:autoreply"
 
+
 def _config_defaults():
+    # ✅ Defaults vides : tout est réglé depuis l’interface /admin/settings
     return {
         "enabled": True,
         "reply_mode": 2,
         "min_in_before_reply": 1,
-        "step0_type": "mms",
-        "step1_type": "mms",
-        "step0_text": "C’est le livreur. Votre colis ne rentrait pas dans la boîte aux lettres ce matin. Je repasse ou je le mets en relais ?",
-        "step1_text": "Ok alors choisissez ici votre nouveau créneau ou point relais : {link}\nSans ça je peux rien faire, merci et bonne journée.",
+        "step0_type": "sms",   # sms|mms
+        "step1_type": "sms",   # sms|mms
+        "step0_text": "",
+        "step1_text": "",
     }
+
 
 def load_config():
     raw = redis_conn.get(CONFIG_KEY)
     defaults = _config_defaults()
     if not raw:
         return defaults
+
     try:
         cfg = json.loads(raw.decode("utf-8"))
         if not isinstance(cfg, dict):
             return defaults
+
         defaults.update(cfg)
+
         # normalisation minimale
         defaults["reply_mode"] = 1 if int(defaults.get("reply_mode", 2)) == 1 else 2
         defaults["min_in_before_reply"] = max(1, int(defaults.get("min_in_before_reply", 1)))
+
         if defaults.get("step0_type") not in ("sms", "mms"):
-            defaults["step0_type"] = "mms"
+            defaults["step0_type"] = "sms"
         if defaults.get("step1_type") not in ("sms", "mms"):
-            defaults["step1_type"] = "mms"
+            defaults["step1_type"] = "sms"
+
+        # sécurité: toujours string
+        defaults["step0_text"] = str(defaults.get("step0_text") or "")
+        defaults["step1_text"] = str(defaults.get("step1_text") or "")
+
+        # enabled bool
+        defaults["enabled"] = bool(defaults.get("enabled", True))
+
         return defaults
     except Exception:
         return defaults
 
+
 def get_conversation_key(number):
     return f"conv:{number}"
+
 
 def is_archived(number):
     return redis_conn.sismember("archived_numbers", number)
 
+
 def archive_number(number):
     redis_conn.sadd("archived_numbers", number)
+
 
 def mark_message_processed(number, msg_id):
     redis_conn.sadd(f"processed:{number}", msg_id)
 
+
 def is_message_processed(number, msg_id):
     return redis_conn.sismember(f"processed:{number}", msg_id)
+
 
 def send_request(url, post_data):
     import requests
@@ -73,7 +93,13 @@ def send_request(url, post_data):
         log(f"❌ Erreur POST : {e}")
         return None
 
+
 def send_single_message(number, message, device_slot, msg_type):
+    # ✅ sécurité : si message vide → ne rien envoyer
+    if not (message or "").strip():
+        log(f"⛔️ Message vide → aucun envoi vers {number} (type={msg_type})")
+        return None
+
     log(f"📦 Envoi à {number} via device {device_slot} (type={msg_type})")
     return send_request(f"{SERVER}/services/send.php", {
         "number": number,
@@ -83,6 +109,7 @@ def send_single_message(number, message, device_slot, msg_type):
         "prioritize": 1,
         "key": API_KEY,
     })
+
 
 @celery.task(name="process_message")
 def process_message(msg_json):
@@ -115,6 +142,7 @@ def process_message(msg_json):
         if is_archived(number):
             log(f"🗃️ [{msg_id_short}] Numéro archivé, ignoré.")
             return
+
         if is_message_processed(number, msg_id):
             log(f"🔁 [{msg_id_short}] Message déjà traité, ignoré.")
             return
@@ -140,15 +168,14 @@ def process_message(msg_json):
         reply_mode = int(cfg.get("reply_mode", 2))
         step0_text = cfg.get("step0_text") or ""
         step1_text = cfg.get("step1_text") or ""
-        link = SECOND_MESSAGE_LINK or ""
-        step0_type = cfg.get("step0_type", "mms")
-        step1_type = cfg.get("step1_type", "mms")
+        step0_type = cfg.get("step0_type", "sms")
+        step1_type = cfg.get("step1_type", "sms")
 
         if step == 0:
             reply = step0_text
             redis_conn.hset(conv_key, "step", 1)
             msg_type = step0_type
-            log(f"📤 [{msg_id_short}] Réponse étape 0 envoyée.")
+            log(f"📤 [{msg_id_short}] Step 0 prêt.")
         elif step == 1:
             if reply_mode == 1:
                 archive_number(number)
@@ -157,10 +184,10 @@ def process_message(msg_json):
                 log(f"✅ [{msg_id_short}] Mode 1 réponse: conversation archivée (pas de step1).")
                 return
 
-            reply = step1_text.replace("{link}", link)
+            reply = step1_text
             redis_conn.hset(conv_key, "step", 2)
             msg_type = step1_type
-            log(f"📤 [{msg_id_short}] Réponse étape 1 envoyée.")
+            log(f"📤 [{msg_id_short}] Step 1 prêt.")
         else:
             archive_number(number)
             redis_conn.delete(conv_key)
@@ -169,8 +196,8 @@ def process_message(msg_json):
 
         send_single_message(number, reply, device_id, msg_type)
         mark_message_processed(number, msg_id)
-        log(f"✅ [{msg_id_short}] Réponse envoyée : {reply}")
-        log(f"🏁 [{msg_id_short}] Fin du traitement de ce message")
+        log(f"✅ [{msg_id_short}] Traitement terminé (envoi tenté si message non vide).")
+        log(f"🏁 [{msg_id_short}] Fin du traitement")
 
     except Exception as e:
         log(f"💥 [{msg_id_short}] Erreur interne : {e}")
