@@ -6,12 +6,17 @@ import base64
 import uuid
 import random
 import time
+import io
+import csv
 
 from flask import Flask, request, Response, redirect, url_for, session, render_template_string
 from redis import Redis
 
 from logger import log
 from tasks import process_message
+
+from openpyxl import load_workbook
+
 
 API_KEY = os.getenv("API_KEY")
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -25,6 +30,12 @@ REDIS_URL = os.getenv("REDIS_URL")
 redis_conn = Redis.from_url(REDIS_URL)
 
 CONFIG_KEY = "config:autoreply"
+
+NL_META_KEY = "nl:meta"
+NL_SAMPLE_KEY = "nl:sample"
+NL_MESSAGE_KEY = "nl:message"   # message draft (UI only)
+NL_TYPE_KEY = "nl:type"         # sms|mms (UI only)
+
 
 app = Flask(__name__)
 app.secret_key = APP_SECRET_KEY or os.urandom(32)
@@ -41,12 +52,10 @@ def _require_login():
 
 
 def _get_config_defaults():
-    # ✅ Defaults vides : tout se configure ici
     return {
-        "enabled": True,
         "reply_mode": 2,        # 1 ou 2
-        "step0_type": "sms",    # sms|mms
-        "step1_type": "sms",    # sms|mms
+        "step0_type": "sms",
+        "step1_type": "sms",
         "step0_text": "",
         "step1_text": "",
     }
@@ -65,7 +74,6 @@ def load_config():
 
         defaults.update(cfg)
 
-        defaults["enabled"] = bool(defaults.get("enabled", True))
         defaults["reply_mode"] = 1 if int(defaults.get("reply_mode", 2)) == 1 else 2
 
         if defaults.get("step0_type") not in ("sms", "mms"):
@@ -99,7 +107,6 @@ def _device_stats(device_id: str):
         "received": _redis_int(base + "received"),
         "sent": _redis_int(base + "sent"),
         "errors": _redis_int(base + "errors"),
-        "last_seen": _redis_int(base + "last_seen"),
         "cycle": _redis_int(f"cycle:device:{device_id}:index"),
         "cycle_sent": _redis_int(f"cycle:device:{device_id}:sent"),
         "cycle_received": _redis_int(f"cycle:device:{device_id}:received"),
@@ -107,12 +114,7 @@ def _device_stats(device_id: str):
 
 
 def fetch_gateway_devices():
-    """
-    ✅ Liste tous les devices du Gateway même si aucun SMS reçu.
-    Endpoint confirmé dans ton Gateway : /services/get-devices.php
-    """
     import requests
-
     if not SERVER or not API_KEY:
         return []
 
@@ -127,6 +129,173 @@ def fetch_gateway_devices():
     except Exception as e:
         log(f"❌ fetch_gateway_devices error: {e}")
         return []
+
+
+def _norm_col(name: str) -> str:
+    return (name or "").strip().lower()
+
+
+def _pick_number_column(columns):
+    """
+    Essaie de deviner la colonne numéro.
+    Si rien n’est sûr => première colonne.
+    """
+    if not columns:
+        return None
+
+    candidates = {
+        "number", "num", "phone", "telephone", "tel", "mobile", "msisdn", "numero", "numéro"
+    }
+    for c in columns:
+        if _norm_col(c) in candidates:
+            return c
+
+    # fallback : première colonne
+    return columns[0]
+
+
+def _read_csv(file_bytes: bytes):
+    # on essaye utf-8, sinon latin-1
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        raise Exception("Encodage CSV non supporté")
+
+    # Sniff delimiter
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,|\t,")
+        delimiter = dialect.delimiter
+    except Exception:
+        delimiter = ","
+
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    rows = list(reader)
+
+    # vide ?
+    if not rows:
+        return [], []
+
+    # header ?
+    header = rows[0]
+    data_rows = rows[1:] if any(h.strip() for h in header) else rows
+
+    # si pas de header propre, on génère col1 col2...
+    if not any(h.strip() for h in header):
+        max_len = max(len(r) for r in rows)
+        header = [f"col{i+1}" for i in range(max_len)]
+        data_rows = rows
+
+    # normalise longueur des lignes
+    cleaned = []
+    for r in data_rows:
+        rr = list(r) + [""] * (len(header) - len(r))
+        cleaned.append(rr[:len(header)])
+
+    return header, cleaned
+
+
+def _read_xlsx(file_bytes: bytes):
+    wb = load_workbook(filename=io.BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb.active
+
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        rows.append([("" if v is None else str(v)) for v in row])
+
+    if not rows:
+        return [], []
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    # si header vide, on fabrique
+    if not any(str(h).strip() for h in header):
+        max_len = max(len(r) for r in rows)
+        header = [f"col{i+1}" for i in range(max_len)]
+        data_rows = rows
+
+    # trim header
+    header = [str(h).strip() if str(h).strip() else f"col{i+1}" for i, h in enumerate(header)]
+
+    cleaned = []
+    for r in data_rows:
+        rr = list(r) + [""] * (len(header) - len(r))
+        cleaned.append(rr[:len(header)])
+
+    return header, cleaned
+
+
+def _build_records(header, rows, number_col):
+    idx = header.index(number_col)
+    records = []
+    for r in rows:
+        if idx >= len(r):
+            continue
+        number = str(r[idx]).strip()
+        if not number:
+            continue
+
+        rec = {}
+        for i, col in enumerate(header):
+            rec[col] = str(r[i]).strip() if i < len(r) else ""
+        records.append(rec)
+    return records
+
+
+def _save_nl_meta(header, number_col, records):
+    variables = [c for c in header if c != number_col]
+    meta = {
+        "count": len(records),
+        "columns": header,
+        "number_col": number_col,
+        "variables": variables,
+        "updated_at": int(time.time()),
+    }
+    redis_conn.set(NL_META_KEY, json.dumps(meta, ensure_ascii=False))
+
+    sample = records[:10]
+    redis_conn.set(NL_SAMPLE_KEY, json.dumps(sample, ensure_ascii=False))
+
+    return meta, sample
+
+
+def _load_nl_meta():
+    raw = redis_conn.get(NL_META_KEY)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _load_nl_sample():
+    raw = redis_conn.get(NL_SAMPLE_KEY)
+    if not raw:
+        return []
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return []
+
+
+def _load_message_draft():
+    msg = (redis_conn.get(NL_MESSAGE_KEY) or b"").decode("utf-8", errors="ignore")
+    msg_type = (redis_conn.get(NL_TYPE_KEY) or b"sms").decode("utf-8", errors="ignore")
+    if msg_type not in ("sms", "mms"):
+        msg_type = "sms"
+    return msg, msg_type
+
+
+def _save_message_draft(message: str, msg_type: str):
+    redis_conn.set(NL_MESSAGE_KEY, message or "")
+    redis_conn.set(NL_TYPE_KEY, msg_type if msg_type in ("sms", "mms") else "sms")
 
 
 # -----------------------
@@ -167,7 +336,7 @@ def admin_login():
   <div class="wrap">
     <div class="card">
       <h2>Connexion</h2>
-      <div class="muted">Accès au panneau de contrôle</div>
+      <div class="muted">Accès au panneau</div>
       <form method="post" style="margin-top:14px">
         <label>Mot de passe</label>
         <input type="password" name="password" autocomplete="current-password">
@@ -194,21 +363,6 @@ def admin_home():
     return redirect(url_for("admin_settings"))
 
 
-@app.route("/admin/devices/<device_id>/next_cycle", methods=["POST"])
-def admin_next_cycle(device_id):
-    guard = _require_login()
-    if guard:
-        return guard
-
-    device_id = str(device_id)
-    new_cycle = redis_conn.incr(f"cycle:device:{device_id}:index")
-    redis_conn.set(f"cycle:device:{device_id}:sent", 0)
-    redis_conn.set(f"cycle:device:{device_id}:received", 0)
-
-    log(f"🔁 Cycle suivant (manuel) device={device_id} -> cycle={new_cycle}")
-    return redirect(url_for("admin_settings"))
-
-
 @app.route("/admin/settings", methods=["GET", "POST"])
 def admin_settings():
     guard = _require_login()
@@ -217,8 +371,15 @@ def admin_settings():
 
     cfg = load_config()
 
-    if request.method == "POST":
-        enabled = request.form.get("enabled") == "on"
+    # Save message draft (UI only)
+    if request.method == "POST" and request.form.get("form_name") == "message_draft":
+        message = (request.form.get("nl_message") or "").strip()
+        msg_type = (request.form.get("nl_type") or "sms").strip().lower()
+        _save_message_draft(message, msg_type)
+        return redirect(url_for("admin_settings"))
+
+    # Save autoreply config
+    if request.method == "POST" and request.form.get("form_name") == "autoreply":
         reply_mode = int(request.form.get("reply_mode") or 2)
 
         step0_type = (request.form.get("step0_type") or "sms").strip().lower()
@@ -234,12 +395,10 @@ def admin_settings():
         if step1_type not in ("sms", "mms"):
             step1_type = "sms"
 
-        # ✅ Si mode 1 réponse : on supprime/ignore Step 1
         if reply_mode == 1:
             step1_text = ""
 
         cfg.update({
-            "enabled": enabled,
             "reply_mode": reply_mode,
             "step0_type": step0_type,
             "step1_type": step1_type,
@@ -249,7 +408,12 @@ def admin_settings():
         save_config(cfg)
         return redirect(url_for("admin_settings"))
 
-    # ✅ Devices du gateway (tous) + stats redis
+    # Read NL meta/sample and message draft
+    nl_meta = _load_nl_meta()
+    nl_sample = _load_nl_sample()
+    nl_message, nl_type = _load_message_draft()
+
+    # Devices
     gw_devices = fetch_gateway_devices()
     rows = []
     for d in gw_devices:
@@ -258,13 +422,8 @@ def admin_settings():
         s.update({
             "name": d.get("name") or "",
             "model": d.get("model") or "",
-            "androidVersion": d.get("androidVersion") or "",
-            "appVersion": d.get("appVersion") or "",
-            "lastSeenAt": d.get("lastSeenAt") or "",
         })
         rows.append(s)
-
-    now = int(time.time())
 
     return render_template_string("""
 <!doctype html>
@@ -289,7 +448,7 @@ def admin_settings():
     .title{font-weight:900;margin-bottom:10px}
     .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
     label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
-    textarea, select{
+    textarea, select, input[type="file"]{
       width:100%;box-sizing:border-box;background:#0e1626;border:1px solid var(--line);
       color:var(--txt);padding:12px;border-radius:12px;outline:none;
     }
@@ -310,6 +469,14 @@ def admin_settings():
     th{color:var(--muted);font-weight:900}
     .hide{display:none}
     code{background:#0e1626;padding:2px 6px;border-radius:10px;border:1px solid var(--line)}
+    .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+    .chip{
+      border:1px solid var(--line); background:#0e1626; color:#cfe0ff;
+      padding:8px 10px; border-radius:999px; cursor:pointer; font-weight:900; font-size:12px;
+    }
+    .chip:hover{filter:brightness(1.15)}
+    .grid2{display:grid;grid-template-columns:1fr;gap:10px}
+    @media(min-width:900px){ .grid2{grid-template-columns:1fr 1fr} }
   </style>
 </head>
 <body>
@@ -322,13 +489,9 @@ def admin_settings():
       </div>
     </div>
 
-    <!-- DEVICES en haut -->
+    <!-- DEVICES -->
     <div class="card">
-      <div class="title">Appareils (Gateway)</div>
-      <div class="muted" style="margin-bottom:10px">
-        Liste complète via <code>/services/get-devices.php</code>. Stats (reçus/envoyés/erreurs) calculées depuis Redis.
-      </div>
-
+      <div class="title">Appareils</div>
       <table>
         <thead>
           <tr>
@@ -340,131 +503,271 @@ def admin_settings():
             <th>Cycle</th>
             <th>Reçus cycle</th>
             <th>Envoyés cycle</th>
-            <th>Dernier vu (Gateway)</th>
-            <th>Action</th>
           </tr>
         </thead>
         <tbody>
           {% if rows|length == 0 %}
-            <tr><td colspan="10" class="muted">Aucun device remonté par le Gateway (vérifie SERVER/API_KEY).</td></tr>
+            <tr><td colspan="8" class="muted">Aucun device (vérifie SERVER/API_KEY).</td></tr>
           {% endif %}
           {% for r in rows %}
             <tr>
-              <td>
-                <div class="pill">
-                  <span class="dot"></span>
-                  <span style="font-weight:900">#{{ r.device_id }}</span>
-                </div>
-              </td>
-              <td>
-                <div style="font-weight:900">{{ r.name }}</div>
-                <div class="muted">{{ r.model }} • Android {{ r.androidVersion }} • App {{ r.appVersion }}</div>
-              </td>
+              <td><div class="pill"><span class="dot"></span><span style="font-weight:900">#{{ r.device_id }}</span></div></td>
+              <td><div style="font-weight:900">{{ r.name }}</div><div class="muted">{{ r.model }}</div></td>
               <td>{{ r.received }}</td>
               <td>{{ r.sent }}</td>
               <td>{{ r.errors }}</td>
               <td>{{ r.cycle }}</td>
               <td>{{ r.cycle_received }}</td>
               <td>{{ r.cycle_sent }}</td>
-              <td class="muted">{{ r.lastSeenAt or "—" }}</td>
-              <td>
-                <form method="post" action="/admin/devices/{{ r.device_id }}/next_cycle" style="margin:0">
-                  <button class="btn2" type="submit">Cycle suivant</button>
-                </form>
-              </td>
             </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
 
-    <!-- SETTINGS -->
-    <form method="post" class="grid" style="margin-top:12px">
+    <!-- NUM LIST IMPORT + MESSAGE -->
+    <div class="card" style="margin-top:12px">
+      <div class="title">Numlist (Excel/CSV) + Variables + Message</div>
 
-      <div class="card">
-        <div class="title">Auto-reply</div>
+      <div class="grid2">
 
-        <div class="row" style="justify-content:space-between">
-          <div class="pill">
-            <input id="enabled" type="checkbox" name="enabled" {% if cfg.enabled %}checked{% endif %}>
-            <div>
-              <div style="font-weight:900">Activé</div>
-              <div class="muted">Désactive toutes les réponses</div>
+        <div>
+          <form method="post" action="/admin/nl/upload" enctype="multipart/form-data">
+            <label>Importer un fichier (.xlsx ou .csv)</label>
+            <input type="file" name="file" accept=".xlsx,.csv" required>
+            <div class="row" style="margin-top:10px">
+              <button class="btn2" type="submit">Importer</button>
+              <a class="btn2" href="/admin/nl/clear" style="display:inline-block;text-align:center;line-height:18px">Vider</a>
             </div>
-          </div>
+          </form>
 
+          {% if nl_meta %}
+            <div class="muted" style="margin-top:12px">
+              <div><b>{{ nl_meta.count }}</b> numéros importés</div>
+              <div>Colonne numéro : <code>{{ nl_meta.number_col }}</code></div>
+              <div style="margin-top:6px">Variables détectées :</div>
+              <div class="chips">
+                {% for v in nl_meta.variables %}
+                  <div class="chip" onclick="insertVar('{{ v }}')">{% raw %}{{{% endraw %}{{ v }}{% raw %}}}{% endraw %}</div>
+                {% endfor %}
+                {% if nl_meta.variables|length == 0 %}
+                  <div class="muted">Aucune variable (seulement la colonne numéro)</div>
+                {% endif %}
+              </div>
+            </div>
+          {% else %}
+            <div class="muted" style="margin-top:12px">
+              Importe un fichier avec au minimum une colonne numéro.
+              Si le fichier a plusieurs colonnes (ex: ville, nom), elles deviennent des variables.
+            </div>
+          {% endif %}
+        </div>
+
+        <div>
+          <form method="post">
+            <input type="hidden" name="form_name" value="message_draft">
+            <div class="row">
+              <div style="min-width:220px;flex:1;max-width:320px">
+                <label>Type de message (draft)</label>
+                <select name="nl_type">
+                  <option value="sms" {% if nl_type == 'sms' %}selected{% endif %}>sms</option>
+                  <option value="mms" {% if nl_type == 'mms' %}selected{% endif %}>mms</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="margin-top:10px">
+              <label>Ton message (tu peux cliquer sur les variables à gauche)</label>
+              <textarea id="nl_message" name="nl_message">{{ nl_message }}</textarea>
+            </div>
+
+            <div style="margin-top:10px">
+              <button class="btn" type="submit">Sauvegarder le message</button>
+            </div>
+
+            {% if nl_sample and nl_meta %}
+              <div class="muted" style="margin-top:12px">
+                Preview variables (10 premières lignes) :
+              </div>
+              <div style="margin-top:6px;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:12px">
+                <table>
+                  <thead>
+                    <tr>
+                      {% for c in nl_meta.columns %}
+                        <th>{{ c }}</th>
+                      {% endfor %}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for rec in nl_sample %}
+                      <tr>
+                        {% for c in nl_meta.columns %}
+                          <td>{{ rec.get(c, "") }}</td>
+                        {% endfor %}
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            {% endif %}
+          </form>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- AUTOREPLY (on garde, mais tu peux ignorer pour l’instant) -->
+    <div class="card" style="margin-top:12px">
+      <div class="title">Auto-reply (réponses)</div>
+      <form method="post" class="grid">
+        <input type="hidden" name="form_name" value="autoreply">
+
+        <div class="row">
           <div style="min-width:260px;flex:1;max-width:320px">
             <label>Mode</label>
             <select id="reply_mode" name="reply_mode">
               <option value="1" {% if cfg.reply_mode == 1 %}selected{% endif %}>1 réponse (puis stop)</option>
               <option value="2" {% if cfg.reply_mode == 2 %}selected{% endif %}>2 réponses (puis stop)</option>
             </select>
-            <div class="muted">Après la dernière réponse, le numéro est archivé et ne recevra plus rien.</div>
           </div>
         </div>
-      </div>
 
-      <div class="card">
-        <div class="title">Step 0</div>
-        <div class="row">
-          <div style="min-width:220px;flex:1;max-width:320px">
-            <label>Type</label>
-            <select name="step0_type">
-              <option value="sms" {% if cfg.step0_type == 'sms' %}selected{% endif %}>sms</option>
-              <option value="mms" {% if cfg.step0_type == 'mms' %}selected{% endif %}>mms</option>
-            </select>
+        <div class="card" style="padding:12px;margin-top:10px">
+          <div class="title">Step 1</div>
+          <div class="row">
+            <div style="min-width:220px;flex:1;max-width:320px">
+              <label>Type</label>
+              <select name="step0_type">
+                <option value="sms" {% if cfg.step0_type == 'sms' %}selected{% endif %}>sms</option>
+                <option value="mms" {% if cfg.step0_type == 'mms' %}selected{% endif %}>mms</option>
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <label>Message</label>
+            <textarea name="step0_text">{{ cfg.step0_text }}</textarea>
           </div>
         </div>
+
+        <div id="step2_block" class="card" style="padding:12px;margin-top:10px">
+          <div class="title">Step 2</div>
+          <div class="row">
+            <div style="min-width:220px;flex:1;max-width:320px">
+              <label>Type</label>
+              <select name="step1_type">
+                <option value="sms" {% if cfg.step1_type == 'sms' %}selected{% endif %}>sms</option>
+                <option value="mms" {% if cfg.step1_type == 'mms' %}selected{% endif %}>mms</option>
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <label>Message</label>
+            <textarea name="step1_text">{{ cfg.step1_text }}</textarea>
+          </div>
+        </div>
+
         <div style="margin-top:10px">
-          <label>Message</label>
-          <textarea name="step0_text">{{ cfg.step0_text }}</textarea>
+          <button class="btn" type="submit">Sauvegarder réponses</button>
+          <div class="muted" style="margin-top:8px">Webhook : <code>/sms_auto_reply</code></div>
         </div>
-      </div>
+      </form>
+    </div>
 
-      <div id="step1_block" class="card">
-        <div class="title">Step 1</div>
-        <div class="row">
-          <div style="min-width:220px;flex:1;max-width:320px">
-            <label>Type</label>
-            <select name="step1_type">
-              <option value="sms" {% if cfg.step1_type == 'sms' %}selected{% endif %}>sms</option>
-              <option value="mms" {% if cfg.step1_type == 'mms' %}selected{% endif %}>mms</option>
-            </select>
-          </div>
-        </div>
-        <div style="margin-top:10px">
-          <label>Message</label>
-          <textarea name="step1_text">{{ cfg.step1_text }}</textarea>
-          <div class="muted">Mets le lien directement dans le texte.</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <button class="btn" type="submit">Sauvegarder</button>
-        <div class="muted" style="margin-top:10px">
-          Webhook inchangé : <code>/sms_auto_reply</code>
-        </div>
-      </div>
-    </form>
   </div>
 
   <script>
-    function toggleStep1() {
+    function insertVar(name){
+      const el = document.getElementById("nl_message");
+      if(!el) return;
+      const token = "{{" + name + "}}";
+
+      const start = el.selectionStart || 0;
+      const end = el.selectionEnd || 0;
+      const before = el.value.substring(0, start);
+      const after = el.value.substring(end);
+
+      el.value = before + token + after;
+      el.focus();
+      const pos = start + token.length;
+      el.setSelectionRange(pos, pos);
+    }
+
+    function toggleStep2() {
       const mode = document.getElementById("reply_mode").value;
-      const block = document.getElementById("step1_block");
+      const block = document.getElementById("step2_block");
       if (mode === "1") block.classList.add("hide");
       else block.classList.remove("hide");
     }
-    document.getElementById("reply_mode").addEventListener("change", toggleStep1);
-    toggleStep1();
+    document.getElementById("reply_mode").addEventListener("change", toggleStep2);
+    toggleStep2();
   </script>
 </body>
 </html>
-""", cfg=cfg, rows=rows, now=now)
+""", cfg=cfg, rows=rows, nl_meta=nl_meta, nl_sample=nl_sample, nl_message=nl_message, nl_type=nl_type)
+
+
+@app.route("/admin/nl/clear", methods=["GET"])
+def admin_nl_clear():
+    guard = _require_login()
+    if guard:
+        return guard
+    redis_conn.delete(NL_META_KEY)
+    redis_conn.delete(NL_SAMPLE_KEY)
+    return redirect(url_for("admin_settings"))
+
+
+@app.route("/admin/nl/upload", methods=["POST"])
+def admin_nl_upload():
+    guard = _require_login()
+    if guard:
+        return guard
+
+    f = request.files.get("file")
+    if not f:
+        return Response("Fichier manquant", status=400)
+
+    filename = (f.filename or "").lower().strip()
+    file_bytes = f.read()
+
+    try:
+        if filename.endswith(".csv"):
+            header, rows = _read_csv(file_bytes)
+        elif filename.endswith(".xlsx"):
+            header, rows = _read_xlsx(file_bytes)
+        else:
+            return Response("Format non supporté (xlsx/csv)", status=400)
+
+        # clean header unique
+        seen = {}
+        final_header = []
+        for h in header:
+            base = (h or "").strip() or "col"
+            if base in seen:
+                seen[base] += 1
+                base = f"{base}_{seen[base]}"
+            else:
+                seen[base] = 1
+            final_header.append(base)
+        header = final_header
+
+        number_col = _pick_number_column(header)
+        if not number_col:
+            return Response("Aucune colonne détectée", status=400)
+
+        records = _build_records(header, rows, number_col)
+
+        meta, sample = _save_nl_meta(header, number_col, records)
+
+        log(f"✅ NL import: count={meta['count']} number_col={meta['number_col']} vars={meta['variables']}")
+        return redirect(url_for("admin_settings"))
+
+    except Exception as e:
+        log(f"❌ NL upload error: {e}")
+        return Response(f"Erreur import: {e}", status=400)
 
 
 # -----------------------
-# WEBHOOK
+# WEBHOOK (inchangé)
 # -----------------------
 @app.route("/sms_auto_reply", methods=["POST"])
 def sms_auto_reply():
@@ -475,8 +778,6 @@ def sms_auto_reply():
     if not messages_raw:
         log(f"[{request_id}] ❌ Champ 'messages' manquant")
         return "messages manquants", 400
-
-    log(f"[{request_id}] 🔎 messages brut : {messages_raw}")
 
     if not DEBUG_MODE:
         signature = request.headers.get("X-SG-SIGNATURE")
@@ -496,7 +797,6 @@ def sms_auto_reply():
 
     try:
         messages = json.loads(messages_raw)
-        log(f"[{request_id}] ✔️ messages parsés : {messages}")
     except json.JSONDecodeError as e:
         log(f"[{request_id}] ❌ JSON invalide : {e}")
         return "Format JSON invalide", 400
@@ -504,12 +804,10 @@ def sms_auto_reply():
     if not isinstance(messages, list):
         return "Liste attendue", 400
 
-    for i, msg in enumerate(messages):
+    for msg in messages:
         try:
             delay = random.randint(60, 180)
-            log(f"[{request_id}] ⏱️ Mise en file message {i} avec délai {delay}s")
-            result = process_message.apply_async(args=[json.dumps(msg)], countdown=delay)
-            log(f"[{request_id}] ✅ Celery ID : {result.id}")
+            process_message.apply_async(args=[json.dumps(msg)], countdown=delay)
         except Exception as e:
             log(f"[{request_id}] ❌ Erreur Celery : {e}")
 
